@@ -10,7 +10,7 @@
 
 import std/test { assert, assert_msg, assert_eq_int, assert_eq_str }
 import std/net { reachable }
-import "./lib" { connect, connect_opts, ConnectOptions, Client }
+import "./lib" { connect, connect_opts, ConnectOptions, Client, MessageKind }
 import "./resp" { Value }
 
 const ADDR: String = "127.0.0.1:6379"
@@ -182,5 +182,65 @@ fun _run(addr: String) -> Result<Bool, Error> {
         ],
     )?
     c.close()
+    return Ok(true)
+}
+
+fun test_pubsub_suite() {
+    if reachable(ADDR) {
+        match _run_pubsub() {
+            Ok(_) -> assert(true),
+            Err(e) -> assert_msg(false, e.message),
+        }
+    }
+}
+
+// Pub/Sub end-to-end: a publisher plus dedicated subscriber connections, over
+// both RESP2 and RESP3, including pattern subscriptions. Subscribers use a read
+// timeout so a missing message fails the test instead of hanging.
+fun _run_pubsub() -> Result<Bool, Error> {
+    let pub = connect(ADDR)?
+
+    // No subscribers yet -> 0 receivers.
+    assert_eq_int(pub.publish("rrtest:chan", "x")?, 0)
+
+    // RESP2 subscriber.
+    let sub = connect_opts(ConnectOptions.new("127.0.0.1", 6379).read_timeout_ms(3000))?
+    sub.subscribe(["rrtest:chan"])?
+    assert_eq_int(pub.publish("rrtest:chan", "hello")?, 1)
+    let m = sub.next_message()?
+    match m.kind {
+        Message -> {
+            assert_eq_str(m.channel, "rrtest:chan")
+            assert_eq_str(m.payload, "hello")
+        },
+        _ -> assert_msg(false, "expected a Message"),
+    }
+    sub.unsubscribe(["rrtest:chan"])?
+    sub.close()
+
+    // RESP3 subscriber (messages arrive as Push frames).
+    let sub3 = connect_opts(ConnectOptions.new("127.0.0.1", 6379).resp3(true).read_timeout_ms(3000))?
+    sub3.subscribe(["rrtest:chan"])?
+    assert_eq_int(pub.publish("rrtest:chan", "world")?, 1)
+    let m3 = sub3.next_message()?
+    assert_eq_str(m3.payload, "world")
+    sub3.close()
+
+    // Pattern subscription.
+    let psub = connect_opts(ConnectOptions.new("127.0.0.1", 6379).read_timeout_ms(3000))?
+    psub.psubscribe(["rrtest:*"])?
+    assert_eq_int(pub.publish("rrtest:news", "p")?, 1)
+    let pm = psub.next_message()?
+    match pm.kind {
+        PMessage -> {
+            assert_eq_str(pm.pattern, "rrtest:*")
+            assert_eq_str(pm.channel, "rrtest:news")
+            assert_eq_str(pm.payload, "p")
+        },
+        _ -> assert_msg(false, "expected a PMessage"),
+    }
+    psub.close()
+
+    pub.close()
     return Ok(true)
 }
