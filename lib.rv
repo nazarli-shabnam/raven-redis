@@ -267,7 +267,7 @@ impl Client {
 
     // GET a key's value; None if the key does not exist.
     fun get(self, key: String) -> Result<Option<String>, Error> {
-        let v = self.command(["GET", key])?
+        let v = self.command(["GET", key])?.without_attributes()
         return match v {
             Bulk(s) -> Ok(Some(s)),
             Null -> Ok(None),
@@ -390,6 +390,57 @@ impl Client {
         let n = _expect_int(self.command(["PERSIST", key])?)?
         return Ok(n == 1)
     }
+
+    // --- Pub/Sub ---
+    // PUBLISH a message to a channel; returns how many clients received it.
+    fun publish(self, channel: String, message: String) -> Result<Int, Error> {
+        return _expect_int(self.command(["PUBLISH", channel, message])?)
+    }
+
+    // SUBSCRIBE to one or more channels, draining one confirmation per channel.
+    // In RESP2 a subscribed connection accepts only (P)(UN)SUBSCRIBE/PING, so
+    // use a dedicated Client for subscribing; RESP3 allows mixing commands.
+    fun subscribe(self, channels: List<String>) -> Result<Bool, Error> {
+        return self._sub_cmd("SUBSCRIBE", channels)
+    }
+
+    // PSUBSCRIBE to one or more glob-style patterns.
+    fun psubscribe(self, patterns: List<String>) -> Result<Bool, Error> {
+        return self._sub_cmd("PSUBSCRIBE", patterns)
+    }
+
+    // UNSUBSCRIBE from the given channels (list must be non-empty).
+    fun unsubscribe(self, channels: List<String>) -> Result<Bool, Error> {
+        return self._sub_cmd("UNSUBSCRIBE", channels)
+    }
+
+    // PUNSUBSCRIBE from the given patterns (list must be non-empty).
+    fun punsubscribe(self, patterns: List<String>) -> Result<Bool, Error> {
+        return self._sub_cmd("PUNSUBSCRIBE", patterns)
+    }
+
+    // Send a (P)(UN)SUBSCRIBE command and drain one confirmation per name.
+    fun _sub_cmd(self, verb: String, names: List<String>) -> Result<Bool, Error> {
+        let args = [verb]
+        for n in names {
+            args.push(n)
+        }
+        self.stream.write(_encode(args))?
+        let i = 0
+        let total = names.len()
+        while i < total {
+            let _confirm = self._read_value()?
+            i = i + 1
+        }
+        return Ok(true)
+    }
+
+    // Block until the next pub/sub frame arrives, then decode it. Subscribe and
+    // unsubscribe confirmations are returned too (with their kind) so nothing is
+    // silently swallowed.
+    fun next_message(self) -> Result<PubSubMessage, Error> {
+        return _parse_pubsub(self._read_value()?)
+    }
 }
 
 // Map a top-level reply to a Result: Redis errors become Err.
@@ -403,6 +454,7 @@ fun _value_to_result(v: Value) -> Result<Value, Error> {
 fun _expect_int(v: Value) -> Result<Int, Error> {
     return match v {
         Int(n) -> Ok(n),
+        Attributed(_a, inner) -> _expect_int(inner),
         _ -> Err(error("expected integer reply")),
     }
 }
@@ -411,6 +463,7 @@ fun _expect_string(v: Value) -> Result<String, Error> {
     return match v {
         Simple(s) -> Ok(s),
         Bulk(s) -> Ok(s),
+        Attributed(_a, inner) -> _expect_string(inner),
         _ -> Err(error("expected string reply")),
     }
 }
@@ -422,9 +475,130 @@ struct ScanResult {
     keys: List<String>,
 }
 
+// The kind of a pub/sub frame returned by next_message.
+enum MessageKind {
+    Message,
+    PMessage,
+    Subscribe,
+    Unsubscribe,
+    PSubscribe,
+    PUnsubscribe,
+    Other,
+}
+
+// A decoded pub/sub frame. Which fields are meaningful depends on `kind`:
+//   Message       -> channel, payload
+//   PMessage      -> pattern, channel, payload
+//   *Subscribe/*Unsubscribe -> channel (the channel or pattern), count
+struct PubSubMessage {
+    kind: MessageKind,
+    channel: String,
+    pattern: String,
+    payload: String,
+    count: Int,
+}
+
+// Map a frame's leading keyword to a MessageKind.
+fun _kind_of(s: String) -> MessageKind {
+    if s == "message" {
+        return MessageKind.Message
+    }
+    if s == "pmessage" {
+        return MessageKind.PMessage
+    }
+    if s == "subscribe" {
+        return MessageKind.Subscribe
+    }
+    if s == "unsubscribe" {
+        return MessageKind.Unsubscribe
+    }
+    if s == "psubscribe" {
+        return MessageKind.PSubscribe
+    }
+    if s == "punsubscribe" {
+        return MessageKind.PUnsubscribe
+    }
+    return MessageKind.Other
+}
+
+// The i-th element of a value list, or Null if out of range (no List.get dep).
+fun _nth(xs: List<Value>, i: Int) -> Value {
+    let cur = 0
+    let out = Value.Null
+    for e in xs {
+        if cur == i {
+            out = e
+        }
+        cur = cur + 1
+    }
+    return out
+}
+
+// The i-th element as a string, or "" if absent / not a string.
+fun _str_at(xs: List<Value>, i: Int) -> String {
+    return match _nth(xs, i).as_string() {
+        Some(s) -> s,
+        None -> "",
+    }
+}
+
+// Decode a pub/sub frame (RESP2 Array or RESP3 Push) into a PubSubMessage.
+fun _parse_pubsub(v: Value) -> Result<PubSubMessage, Error> {
+    return match v.without_attributes().as_array() {
+        Some(xs) -> _build_pubsub(xs),
+        None -> Err(error("pub/sub: expected an array or push frame")),
+    }
+}
+
+fun _build_pubsub(xs: List<Value>) -> Result<PubSubMessage, Error> {
+    if xs.len() < 3 {
+        return Err(error("pub/sub: frame too short"))
+    }
+    let kind = _kind_of(_str_at(xs, 0))
+    return match kind {
+        Message -> Ok(
+            PubSubMessage {
+                kind: MessageKind.Message,
+                channel: _str_at(xs, 1),
+                pattern: "",
+                payload: _str_at(xs, 2),
+                count: 0,
+            },
+        ),
+        PMessage -> Ok(
+            PubSubMessage {
+                kind: MessageKind.PMessage,
+                channel: _str_at(xs, 2),
+                pattern: _str_at(xs, 1),
+                payload: _str_at(xs, 3),
+                count: 0,
+            },
+        ),
+        other -> _build_confirmation(other, xs),
+    }
+}
+
+// Build a (un)subscribe confirmation: [kind, channel-or-pattern, count].
+fun _build_confirmation(kind: MessageKind, xs: List<Value>) -> Result<PubSubMessage, Error> {
+    let name = _str_at(xs, 1)
+    let cnt = match _nth(xs, 2).as_int() {
+        Some(n) -> n,
+        None -> 0,
+    }
+    return Ok(
+        PubSubMessage {
+            kind,
+            channel: name,
+            pattern: name,
+            payload: "",
+            count: cnt,
+        },
+    )
+}
+
 // Convert an array reply of strings into a List<String>.
 fun _to_string_list(v: Value) -> Result<List<String>, Error> {
-    return match v {
+    return match v.without_attributes() {
         Array(xs) -> {
             let out: List<String> = []
             for e in xs {
@@ -448,7 +622,7 @@ fun _to_string_list(v: Value) -> Result<List<String>, Error> {
 
 // Convert an array reply into a List<Option<String>> (Null elements -> None).
 fun _to_opt_string_list(v: Value) -> Result<List<Option<String>>, Error> {
-    return match v {
+    return match v.without_attributes() {
         Array(xs) -> {
             let out: List<Option<String>> = []
             for e in xs {
@@ -479,7 +653,7 @@ fun _parse_int_or_err(s: String) -> Result<Int, Error> {
 
 // Parse a SCAN reply: [cursor-as-string, [keys...]].
 fun _parse_scan(v: Value) -> Result<ScanResult, Error> {
-    return match v {
+    return match v.without_attributes() {
         Array(xs) -> {
             if xs.len() != 2 {
                 return Err(error("SCAN: malformed reply"))

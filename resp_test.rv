@@ -1,5 +1,6 @@
 import std/test { assert, assert_msg, assert_eq_int, assert_eq_str, assert_eq_float }
 import std/string
+import std/math { is_inf, is_nan }
 import "./resp" { _encode, _parse_at, Value, _ParseResult }
 
 // --- Encoder ---
@@ -280,14 +281,93 @@ fun test_parse_push() {
     }
 }
 
-// Attributes precede the real value and must be consumed, then skipped.
-fun test_parse_attribute_skipped() {
+// Attributes decorate the value that follows; they are surfaced as Attributed,
+// and accessors transparently see through to the inner value.
+fun test_parse_attribute_surfaced() {
     match _parse_at("|1\r\n$3\r\nkey\r\n$3\r\nval\r\n:25\r\n", 0) {
-        Complete(v, np) -> match v {
-            Int(n) -> assert_eq_int(n, 25),
-            _ -> assert_msg(false, "expected the Int that follows the attribute"),
+        Complete(v, np) -> {
+            assert_eq_int(np, 27)
+            // transparent: as_int sees through the attribute wrapper
+            match v.as_int() {
+                Some(n) -> assert_eq_int(n, 25),
+                None -> assert_msg(false, "as_int should see through attributes"),
+            }
+            // the attribute pairs are available (1 pair -> 2 flat elements)
+            match v.attributes() {
+                Some(a) -> assert_eq_int(a.len(), 2),
+                None -> assert_msg(false, "expected attributes to be present"),
+            }
+            // stripping yields the underlying Int
+            match v.without_attributes() {
+                Int(n) -> assert_eq_int(n, 25),
+                _ -> assert_msg(false, "expected Int after without_attributes"),
+            }
         },
         _ -> assert_msg(false, "expected Complete"),
+    }
+}
+
+// An attribute can decorate an aggregate; as_map must see through it.
+fun test_parse_attribute_over_map() {
+    match _parse_at("|1\r\n$1\r\nk\r\n$1\r\nv\r\n%1\r\n$1\r\na\r\n$1\r\nb\r\n", 0) {
+        Complete(v, np) -> match v.as_map() {
+            Some(m) -> assert_eq_int(m.len(), 2),
+            None -> assert_msg(false, "as_map should see through attributes"),
+        },
+        _ -> assert_msg(false, "expected Complete"),
+    }
+}
+
+// An attribute with the decorated value not yet arrived must be Incomplete.
+fun test_parse_attribute_incomplete() {
+    match _parse_at("|1\r\n$3\r\nkey\r\n$3\r\nval\r\n", 0) {
+        Incomplete -> assert(true),
+        _ -> assert_msg(false, "expected Incomplete (decorated value missing)"),
+    }
+}
+
+// --- RESP3 special doubles ---
+
+fun test_parse_double_inf() {
+    match _parse_at(",inf\r\n", 0) {
+        Complete(v, np) -> match v {
+            Double(d) -> {
+                assert(is_inf(d))
+                assert(d > 0.0)
+            },
+            _ -> assert_msg(false, "expected Double"),
+        },
+        _ -> assert_msg(false, "expected Complete"),
+    }
+}
+
+fun test_parse_double_neg_inf() {
+    match _parse_at(",-inf\r\n", 0) {
+        Complete(v, np) -> match v {
+            Double(d) -> {
+                assert(is_inf(d))
+                assert(d < 0.0)
+            },
+            _ -> assert_msg(false, "expected Double"),
+        },
+        _ -> assert_msg(false, "expected Complete"),
+    }
+}
+
+fun test_parse_double_nan() {
+    match _parse_at(",nan\r\n", 0) {
+        Complete(v, np) -> match v {
+            Double(d) -> assert(is_nan(d)),
+            _ -> assert_msg(false, "expected Double"),
+        },
+        _ -> assert_msg(false, "expected Complete"),
+    }
+}
+
+fun test_parse_double_incomplete() {
+    match _parse_at(",3.1", 0) {
+        Incomplete -> assert(true),
+        _ -> assert_msg(false, "expected Incomplete (no CRLF yet)"),
     }
 }
 

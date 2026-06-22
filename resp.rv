@@ -7,6 +7,7 @@
 // `HELLO 3` (see ConnectOptions.resp3 in lib.rv).
 
 import std/string
+import std/math { infinity, nan }
 
 // A decoded Redis reply. The first six variants are RESP2; the rest are the
 // extra self-describing types introduced by RESP3.
@@ -18,12 +19,13 @@ enum Value {
     Null, // $-1 / *-1 (RESP2) or _\r\n (RESP3)
     Array(List<Value>), // *<n>\r\n<elements...>
     Bool(Bool), // #t\r\n / #f\r\n
-    Double(Float), // ,3.14\r\n
+    Double(Float), // ,3.14\r\n  (also ,inf / ,-inf / ,nan)
     BigNumber(String), // (1234...\r\n  (kept as text; may exceed Int)
     Verbatim(String, String), // =<n>\r\n<fmt>:<text>  -> (fmt, text)
     Map(List<Value>), // %<n>  -> 2n elements, alternating key,value
     Set(List<Value>), // ~<n>\r\n<elements...>
     Push(List<Value>), // ><n>\r\n<elements...>  (out-of-band / pub-sub)
+    Attributed(List<Value>, Value), // |<n>... metadata attached to a value
 }
 
 // Result of attempting to parse one frame starting at a byte offset.
@@ -37,11 +39,13 @@ enum _ParseResult {
 
 impl Value {
     // The text of a simple, bulk, or verbatim string, if this is one.
+    // Transparently sees through an Attributed wrapper.
     fun as_string(self) -> Option<String> {
         return match self {
             Simple(s) -> Some(s),
             Bulk(s) -> Some(s),
             Verbatim(_f, t) -> Some(t),
+            Attributed(_a, v) -> v.as_string(),
             _ -> None,
         }
     }
@@ -50,6 +54,7 @@ impl Value {
     fun as_int(self) -> Option<Int> {
         return match self {
             Int(n) -> Some(n),
+            Attributed(_a, v) -> v.as_int(),
             _ -> None,
         }
     }
@@ -58,6 +63,7 @@ impl Value {
     fun as_bool(self) -> Option<Bool> {
         return match self {
             Bool(b) -> Some(b),
+            Attributed(_a, v) -> v.as_bool(),
             _ -> None,
         }
     }
@@ -66,6 +72,7 @@ impl Value {
     fun as_double(self) -> Option<Float> {
         return match self {
             Double(d) -> Some(d),
+            Attributed(_a, v) -> v.as_double(),
             _ -> None,
         }
     }
@@ -76,6 +83,7 @@ impl Value {
             Array(xs) -> Some(xs),
             Set(xs) -> Some(xs),
             Push(xs) -> Some(xs),
+            Attributed(_a, v) -> v.as_array(),
             _ -> None,
         }
     }
@@ -84,6 +92,7 @@ impl Value {
     fun as_map(self) -> Option<List<Value>> {
         return match self {
             Map(xs) -> Some(xs),
+            Attributed(_a, v) -> v.as_map(),
             _ -> None,
         }
     }
@@ -92,7 +101,26 @@ impl Value {
     fun is_null(self) -> Bool {
         return match self {
             Null -> true,
+            Attributed(_a, v) -> v.is_null(),
             _ -> false,
+        }
+    }
+
+    // The RESP3 attribute pairs (flat key,value,...) attached to this reply,
+    // if any. None for an ordinary reply.
+    fun attributes(self) -> Option<List<Value>> {
+        return match self {
+            Attributed(a, _v) -> Some(a),
+            _ -> None,
+        }
+    }
+
+    // The underlying value with one layer of attributes stripped (no-op for an
+    // ordinary reply).
+    fun without_attributes(self) -> Value {
+        return match self {
+            Attributed(_a, v) -> v,
+            other -> other,
         }
     }
 }
@@ -194,8 +222,20 @@ fun _parse_at(buf: String, pos: Int) -> _ParseResult {
         }
         return _ParseResult.Invalid("invalid boolean: ".concat(line))
     }
-    // ',' double
+    // ',' double  (also the special values inf / -inf / nan)
     if prefix == 44 {
+        if line == "inf" {
+            return _ParseResult.Complete(Value.Double(infinity()), after)
+        }
+        if line == "+inf" {
+            return _ParseResult.Complete(Value.Double(infinity()), after)
+        }
+        if line == "-inf" {
+            return _ParseResult.Complete(Value.Double(0.0 - infinity()), after)
+        }
+        if line == "nan" {
+            return _ParseResult.Complete(Value.Double(nan()), after)
+        }
         return match line.parse_float() {
             Some(d) -> _ParseResult.Complete(Value.Double(d), after),
             None -> _ParseResult.Invalid("invalid double: ".concat(line)),
@@ -352,15 +392,32 @@ fun _rewrap_seq(buf: String, start: Int, count: Int, kind: Int, elems: Int) -> _
     return _ParseResult.Invalid("aggregate: unreachable")
 }
 
-// Attribute: consume `count` key/value pairs (2*count elements), then parse and
-// return the actual value that follows. Attributes are skipped in this version.
+// Attribute: parse `count` key/value pairs (2*count elements), then the value
+// they decorate, and return them together as Attributed(pairs, value).
 fun _parse_attribute(buf: String, start: Int, count: Int) -> _ParseResult {
     if count < 0 {
         return _ParseResult.Invalid("negative attribute length")
     }
     match _parse_array(buf, start, count + count) {
-        Complete(_attr, np) -> {
-            return _parse_at(buf, np)
+        Complete(attr, np) -> {
+            match attr {
+                Array(pairs) -> {
+                    match _parse_at(buf, np) {
+                        Complete(val, np2) -> {
+                            return _ParseResult.Complete(Value.Attributed(pairs, val), np2)
+                        },
+                        Incomplete -> {
+                            return _ParseResult.Incomplete
+                        },
+                        Invalid(m) -> {
+                            return _ParseResult.Invalid(m)
+                        },
+                    }
+                },
+                _ -> {
+                    return _ParseResult.Invalid("attribute: internal error")
+                },
+            }
         },
         Incomplete -> {
             return _ParseResult.Incomplete
