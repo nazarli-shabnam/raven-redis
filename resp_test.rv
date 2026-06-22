@@ -9,10 +9,7 @@ fun test_encode_single() {
 }
 
 fun test_encode_multi() {
-    assert_eq_str(
-        _encode(["SET", "k", "v"]),
-        "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
-    )
+    assert_eq_str(_encode(["SET", "k", "v"]), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
 }
 
 // Argument containing CRLF must be length-prefixed verbatim (binary-safe).
@@ -30,7 +27,7 @@ fun test_parse_simple() {
                 Simple(s) -> assert_eq_str(s, "OK"),
                 _ -> assert_msg(false, "expected Simple"),
             }
-        }
+        },
         _ -> assert_msg(false, "expected Complete"),
     }
 }
@@ -53,7 +50,7 @@ fun test_parse_int() {
                 Int(n) -> assert_eq_int(n, 1000),
                 _ -> assert_msg(false, "expected Int"),
             }
-        }
+        },
         _ -> assert_msg(false, "expected Complete"),
     }
 }
@@ -68,7 +65,7 @@ fun test_parse_bulk() {
                 Bulk(s) -> assert_eq_str(s, "foobar"),
                 _ -> assert_msg(false, "expected Bulk"),
             }
-        }
+        },
         _ -> assert_msg(false, "expected Complete"),
     }
 }
@@ -81,7 +78,7 @@ fun test_parse_bulk_empty() {
                 Bulk(s) -> assert_eq_str(s, ""),
                 _ -> assert_msg(false, "expected empty Bulk"),
             }
-        }
+        },
         _ -> assert_msg(false, "expected Complete"),
     }
 }
@@ -102,10 +99,10 @@ fun test_parse_bulk_binary() {
                 Bulk(s) -> {
                     assert_eq_int(s.len(), 4)
                     assert_eq_str(s, "a\r\nb")
-                }
+                },
                 _ -> assert_msg(false, "expected Bulk"),
             }
-        }
+        },
         _ -> assert_msg(false, "expected Complete"),
     }
 }
@@ -117,7 +114,7 @@ fun test_parse_array() {
         Complete(v, np) -> match v {
             Array(xs) -> {
                 assert_eq_int(xs.len(), 2)
-            }
+            },
             _ -> assert_msg(false, "expected Array"),
         },
         _ -> assert_msg(false, "expected Complete"),
@@ -165,7 +162,7 @@ fun test_split_buffer_then_complete() {
                 Bulk(s) -> assert_eq_str(s, "foobar"),
                 _ -> assert_msg(false, "expected Bulk"),
             }
-        }
+        },
         _ -> assert_msg(false, "expected Complete"),
     }
 }

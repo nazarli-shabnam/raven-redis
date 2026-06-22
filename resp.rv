@@ -8,19 +8,19 @@ import std/string
 
 // A decoded Redis reply (RESP2).
 enum Value {
-    Simple(String),       // +OK\r\n
-    Error(String),        // -ERR ...\r\n  (the client maps top-level errors to Err)
-    Int(Int),             // :123\r\n
-    Bulk(String),         // $<n>\r\n<bytes>\r\n  (binary-safe)
-    Null,                 // $-1\r\n or *-1\r\n
-    Array(List<Value>),   // *<n>\r\n<elements...>
+    Simple(String), // +OK\r\n
+    Error(String), // -ERR ...\r\n  (the client maps top-level errors to Err)
+    Int(Int), // :123\r\n
+    Bulk(String), // $<n>\r\n<bytes>\r\n  (binary-safe)
+    Null, // $-1\r\n or *-1\r\n
+    Array(List<Value>), // *<n>\r\n<elements...>
 }
 
 // Result of attempting to parse one frame starting at a byte offset.
 enum ParseResult {
-    Complete(Value, Int),   // a full value, plus the offset just past it
-    Incomplete,             // need more bytes before a full frame is available
-    Invalid(String),        // the bytes are not valid RESP
+    Complete(Value, Int), // a full value, plus the offset just past it
+    Incomplete, // need more bytes before a full frame is available
+    Invalid(String), // the bytes are not valid RESP
 }
 
 // --- Reply accessors (ergonomic extraction) ---
@@ -163,9 +163,13 @@ fun _parse_array(buf: String, start: Int, count: Int) -> ParseResult {
             Complete(v, np) -> {
                 items.push(v)
                 cur = np
-            }
-            Incomplete -> { return ParseResult.Incomplete }
-            Invalid(m) -> { return ParseResult.Invalid(m) }
+            },
+            Incomplete -> {
+                return ParseResult.Incomplete
+            },
+            Invalid(m) -> {
+                return ParseResult.Invalid(m)
+            },
         }
         i = i + 1
     }
