@@ -1,16 +1,141 @@
-// lib.rv is the entry point of the `raven-redis` package: the items declared
-// here are what other projects import, for example:
-//   import "github.com/<user>/raven-redis" { greet, Greeting }
+// raven-redis — a Redis client for the Raven programming language.
 //
-// A sub-path import like `github.com/<user>/raven-redis/util` loads `util.rv`
-// next to this file.
+// Public API (import from the package root):
+//   connect, Client, and the typed helpers below.
+// Power users running arbitrary commands also import `Value` from the
+// `resp` submodule to destructure replies.
+//
+// RESP2 only. RESP3 is intentionally NOT implemented yet (future release).
+// No TLS (std/net has none). Single connection, no pooling.
 
+import std/net { connect as tcp_connect, TcpStream }
 import std/string
+import std/error { error }
+import "./resp" { Value, ParseResult, _encode, _parse_at }
 
-struct Greeting {
-    who: String,
+// A single, synchronous connection to a Redis server.
+struct Client {
+    stream: TcpStream,
+    buf: String,        // bytes received but not yet parsed
 }
 
-fun greet(who: String) -> String {
-    return "hello, ".concat(who)
+// Open a connection to "host:port" (e.g. "127.0.0.1:6379").
+fun connect(addr: String) -> Result<Client, Error> {
+    let stream = tcp_connect(addr)?
+    return Ok(Client { stream: stream, buf: "" })
+}
+
+impl Client {
+    // Run any Redis command. A top-level Redis error reply becomes Err.
+    fun command(self, args: List<String>) -> Result<Value, Error> {
+        let payload = _encode(args)
+        self.stream.write(payload)?
+        return self._read_reply()
+    }
+
+    // Read exactly one reply, pulling more bytes from the socket as needed.
+    // This is the only place that performs blocking I/O.
+    fun _read_reply(self) -> Result<Value, Error> {
+        while true {
+            match _parse_at(self.buf, 0) {
+                Complete(v, np) -> {
+                    self.buf = self.buf.substring(np, self.buf.len())
+                    return _value_to_result(v)
+                }
+                Invalid(m) -> { return Err(error(m)) }
+                Incomplete -> {
+                    let chunk = self.stream.read(4096)?
+                    if chunk.len() == 0 {
+                        return Err(error("connection closed while reading reply"))
+                    }
+                    self.buf = self.buf.concat(chunk)
+                }
+            }
+        }
+        return Err(error("unreachable"))
+    }
+
+    fun close(self) {
+        self.stream.close()
+    }
+
+    // --- Typed helpers (common commands) ---
+
+    fun ping(self) -> Result<String, Error> {
+        return _expect_string(self.command(["PING"])?)
+    }
+
+    fun echo(self, msg: String) -> Result<String, Error> {
+        return _expect_string(self.command(["ECHO", msg])?)
+    }
+
+    fun set(self, key: String, val: String) -> Result<Bool, Error> {
+        self.command(["SET", key, val])?
+        return Ok(true)
+    }
+
+    fun get(self, key: String) -> Result<Option<String>, Error> {
+        let v = self.command(["GET", key])?
+        return match v {
+            Bulk(s) -> Ok(Some(s)),
+            Null -> Ok(None),
+            _ -> Err(error("GET: unexpected reply")),
+        }
+    }
+
+    fun del(self, keys: List<String>) -> Result<Int, Error> {
+        let args = ["DEL"]
+        for k in keys {
+            args.push(k)
+        }
+        return _expect_int(self.command(args)?)
+    }
+
+    fun exists(self, keys: List<String>) -> Result<Int, Error> {
+        let args = ["EXISTS"]
+        for k in keys {
+            args.push(k)
+        }
+        return _expect_int(self.command(args)?)
+    }
+
+    fun incr(self, key: String) -> Result<Int, Error> {
+        return _expect_int(self.command(["INCR", key])?)
+    }
+
+    fun decr(self, key: String) -> Result<Int, Error> {
+        return _expect_int(self.command(["DECR", key])?)
+    }
+
+    fun expire(self, key: String, seconds: Int) -> Result<Bool, Error> {
+        let n = _expect_int(self.command(["EXPIRE", key, "${seconds}"])?)?
+        return Ok(n == 1)
+    }
+
+    fun ttl(self, key: String) -> Result<Int, Error> {
+        return _expect_int(self.command(["TTL", key])?)
+    }
+}
+
+// Map a top-level reply to a Result: Redis errors become Err.
+fun _value_to_result(v: Value) -> Result<Value, Error> {
+    return match v {
+        Error(m) -> Err(error(m)),
+        other -> Ok(other),
+    }
+}
+
+fun _expect_int(v: Value) -> Result<Int, Error> {
+    return match v {
+        Int(n) -> Ok(n),
+        _ -> Err(error("expected integer reply")),
+    }
+}
+
+fun _expect_string(v: Value) -> Result<String, Error> {
+    return match v {
+        Simple(s) -> Ok(s),
+        Bulk(s) -> Ok(s),
+        _ -> Err(error("expected string reply")),
+    }
 }
