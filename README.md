@@ -51,19 +51,28 @@ let client = connect_opts(opts)?
 
 ## Pipelining
 
+Send several commands in one round trip and get one reply per command:
+
 ```raven
-let p = client.pipeline()
-p.queue(["SET", "a", "1"])
-p.queue(["INCR", "a"])
-p.queue(["GET", "a"])
-let replies = p.exec()?   // List<Value>, one per queued command
+let replies = client.pipeline([
+    ["SET", "a", "1"],
+    ["INCR", "a"],
+    ["GET", "a"],
+])?
+// replies : List<Value>, one entry per command, in order.
 ```
+
+Pipeline replies are returned **raw** (a Redis error appears as `Value.Error`
+rather than aborting), so one failing command never desyncs the rest.
 
 ## Reply values
 
-`command()` returns a `Value`:
+`command()` returns a `Value`. To destructure it, import the type from the
+`resp` submodule:
 
 ```raven
+import "github.com/martian56/raven-redis/resp" { Value }
+
 enum Value {
     Simple(String),       // +OK
     Error(String),        // -ERR ...  (top-level errors surface as Err instead)
