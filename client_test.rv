@@ -203,6 +203,13 @@ fun _run_pubsub() -> Result<Bool, Error> {
     // No subscribers yet -> 0 receivers.
     assert_eq_int(pub.publish("rrtest:chan", "x")?, 0)
 
+    // An empty subscribe list is rejected (would otherwise desync the stream).
+    let no_channels: List<String> = []
+    match pub.subscribe(no_channels) {
+        Ok(_x) -> assert_msg(false, "subscribe([]) must be an error"),
+        Err(_e) -> assert(true),
+    }
+
     // RESP2 subscriber.
     let sub = connect_opts(ConnectOptions.new("127.0.0.1", 6379).read_timeout_ms(3000))?
     sub.subscribe(["rrtest:chan"])?

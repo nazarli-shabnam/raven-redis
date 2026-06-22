@@ -323,7 +323,7 @@ impl Client {
     // SET only if the key does not exist (SET key val NX).
     // Returns true if stored, false if the key already existed.
     fun set_nx(self, key: String, val: String) -> Result<Bool, Error> {
-        let v = self.command(["SET", key, val, "NX"])?
+        let v = self.command(["SET", key, val, "NX"])?.without_attributes()
         return match v {
             Null -> Ok(false),
             _ -> Ok(true),
@@ -409,7 +409,8 @@ impl Client {
         return self._sub_cmd("PSUBSCRIBE", patterns)
     }
 
-    // UNSUBSCRIBE from the given channels (list must be non-empty).
+    // UNSUBSCRIBE from the given channels (list must be non-empty;
+    // "unsubscribe from everything" is not supported — pass explicit channels).
     fun unsubscribe(self, channels: List<String>) -> Result<Bool, Error> {
         return self._sub_cmd("UNSUBSCRIBE", channels)
     }
@@ -420,7 +421,12 @@ impl Client {
     }
 
     // Send a (P)(UN)SUBSCRIBE command and drain one confirmation per name.
+    // The list must be non-empty: the reply-frame count is driven by the
+    // number of names, so an empty list would desync the connection.
     fun _sub_cmd(self, verb: String, names: List<String>) -> Result<Bool, Error> {
+        if names.len() == 0 {
+            return Err(error("pub/sub: channel/pattern list must be non-empty"))
+        }
         let args = [verb]
         for n in names {
             args.push(n)
@@ -429,7 +435,9 @@ impl Client {
         let i = 0
         let total = names.len()
         while i < total {
-            let _confirm = self._read_value()?
+            // Route through _value_to_result so a server -ERR (NOAUTH, NOPERM,
+            // wrong context, ...) surfaces as Err instead of being swallowed.
+            let _confirm = _value_to_result(self._read_value()?)?
             i = i + 1
         }
         return Ok(true)
@@ -437,16 +445,18 @@ impl Client {
 
     // Block until the next pub/sub frame arrives, then decode it. Subscribe and
     // unsubscribe confirmations are returned too (with their kind) so nothing is
-    // silently swallowed.
+    // silently swallowed. A server error frame surfaces as Err.
     fun next_message(self) -> Result<PubSubMessage, Error> {
-        return _parse_pubsub(self._read_value()?)
+        return _parse_pubsub(_value_to_result(self._read_value()?)?)
     }
 }
 
-// Map a top-level reply to a Result: Redis errors become Err.
+// Map a top-level reply to a Result: Redis errors become Err. Sees through an
+// Attributed wrapper so an attributed error reply still becomes Err.
 fun _value_to_result(v: Value) -> Result<Value, Error> {
     return match v {
         Error(m) -> Err(error(m)),
+        Attributed(_a, inner) -> _value_to_result(inner),
         other -> Ok(other),
     }
 }
@@ -555,6 +565,17 @@ fun _build_pubsub(xs: List<Value>) -> Result<PubSubMessage, Error> {
         return Err(error("pub/sub: frame too short"))
     }
     let kind = _kind_of(_str_at(xs, 0))
+    // pmessage is a 4-element frame [kind, pattern, channel, payload]; reject a
+    // truncated one rather than silently reporting an empty payload.
+    let is_pmessage = match kind {
+        PMessage -> true,
+        _ -> false,
+    }
+    if is_pmessage {
+        if xs.len() < 4 {
+            return Err(error("pub/sub: pmessage frame too short"))
+        }
+    }
     return match kind {
         Message -> Ok(
             PubSubMessage {
@@ -602,7 +623,7 @@ fun _to_string_list(v: Value) -> Result<List<String>, Error> {
         Array(xs) -> {
             let out: List<String> = []
             for e in xs {
-                match e {
+                match e.without_attributes() {
                     Bulk(s) -> {
                         out.push(s)
                     },
@@ -626,7 +647,7 @@ fun _to_opt_string_list(v: Value) -> Result<List<Option<String>>, Error> {
         Array(xs) -> {
             let out: List<Option<String>> = []
             for e in xs {
-                match e {
+                match e.without_attributes() {
                     Bulk(s) -> {
                         out.push(Some(s))
                     },

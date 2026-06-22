@@ -94,3 +94,13 @@ fun test_pubsub_rejects_non_array() {
         Err(_e) -> assert(true),
     }
 }
+
+// Regression: a truncated 3-element pmessage must be rejected, not silently
+// reported with an empty payload.
+fun test_pubsub_pmessage_too_short() {
+    let f = Value.Push([Value.Bulk("pmessage"), Value.Bulk("news.*"), Value.Bulk("news.tech")])
+    match _parse_pubsub(f) {
+        Ok(_m) -> assert_msg(false, "expected Err for a truncated pmessage frame"),
+        Err(_e) -> assert(true),
+    }
+}
