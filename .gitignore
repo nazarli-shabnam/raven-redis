@@ -1,0 +1,7 @@
+# Raven build output
+target/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
