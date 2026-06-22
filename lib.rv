@@ -1,0 +1,16 @@
+// lib.rv is the entry point of the `raven-redis` package: the items declared
+// here are what other projects import, for example:
+//   import "github.com/<user>/raven-redis" { greet, Greeting }
+//
+// A sub-path import like `github.com/<user>/raven-redis/util` loads `util.rv`
+// next to this file.
+
+import std/string
+
+struct Greeting {
+    who: String,
+}
+
+fun greet(who: String) -> String {
+    return "hello, ".concat(who)
+}
