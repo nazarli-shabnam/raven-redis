@@ -10,7 +10,8 @@
 
 import std/test { assert, assert_msg, assert_eq_int, assert_eq_str }
 import std/net { reachable }
-import "./lib" { connect, Client }
+import "./lib" { connect, connect_opts, ConnectOptions, Client }
+import "./resp" { Value }
 
 const ADDR: String = "127.0.0.1:6379"
 
@@ -21,6 +22,49 @@ fun test_integration_suite() {
             Err(e) -> assert_msg(false, e.message),
         }
     }
+}
+
+fun test_resp3_suite() {
+    if reachable(ADDR) {
+        match _run_resp3() {
+            Ok(_) -> assert(true),
+            Err(e) -> assert_msg(false, e.message),
+        }
+    }
+}
+
+// RESP3-specific reply types, verified against a live RESP3-capable server.
+fun _run_resp3() -> Result<Bool, Error> {
+    let opts = ConnectOptions.new("127.0.0.1", 6379).resp3(true)
+    let c = connect_opts(opts)?
+
+    c.del(["rrtest:h", "rrtest:set"])?
+
+    // HGETALL returns a Map in RESP3 (2 fields -> 4 flat elements).
+    c.command(["HSET", "rrtest:h", "f1", "v1", "f2", "v2"])?
+    match c.command(["HGETALL", "rrtest:h"])? {
+        Map(xs) -> assert_eq_int(xs.len(), 4),
+        _ -> assert_msg(false, "expected Map from HGETALL in RESP3"),
+    }
+
+    // SMEMBERS returns a Set in RESP3.
+    c.command(["SADD", "rrtest:set", "a", "b", "c"])?
+    match c.command(["SMEMBERS", "rrtest:set"])? {
+        Set(xs) -> assert_eq_int(xs.len(), 3),
+        _ -> assert_msg(false, "expected Set from SMEMBERS in RESP3"),
+    }
+
+    // Membership check: some servers reply with a RESP3 Bool, others still
+    // with an Int (1/0). Accept either — Bool parsing is covered by unit tests.
+    match c.command(["SISMEMBER", "rrtest:set", "a"])? {
+        Bool(b) -> assert(b),
+        Int(n) -> assert_eq_int(n, 1),
+        _ -> assert_msg(false, "expected Bool or Int from SISMEMBER"),
+    }
+
+    c.del(["rrtest:h", "rrtest:set"])?
+    c.close()
+    return Ok(true)
 }
 
 // The whole flow as one Result-returning routine so we can use `?`.
