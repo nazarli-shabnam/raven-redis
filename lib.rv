@@ -5,7 +5,7 @@
 // Power users running arbitrary commands also import `Value` from the
 // `resp` submodule to destructure replies.
 //
-// RESP2 only. RESP3 is intentionally NOT implemented yet (future release).
+// Speaks RESP2 by default; RESP3 is opt-in via ConnectOptions.resp3 / hello3.
 // No TLS (std/net has none). Single connection, no pooling.
 
 import std/net { connect as tcp_connect, TcpStream }
@@ -26,7 +26,8 @@ fun connect(addr: String) -> Result<Client, Error> {
 }
 
 // Connection settings. Build with ConnectOptions.new(host, port) and chain the
-// immutable setters; an empty string / zero means "unset".
+// immutable setters; an empty string / zero / false means "unset". When resp3
+// is true, connect_opts negotiates RESP3 with HELLO 3.
 struct ConnectOptions {
     host: String,
     port: Int,
@@ -35,9 +36,11 @@ struct ConnectOptions {
     db: Int,
     client_name: String,
     read_timeout_ms: Int,
+    resp3: Bool,
 }
 
 impl ConnectOptions {
+    // Create options for host:port with everything else unset.
     fun new(host: String, port: Int) -> ConnectOptions {
         return ConnectOptions {
             host,
@@ -47,9 +50,11 @@ impl ConnectOptions {
             db: 0,
             client_name: "",
             read_timeout_ms: 0,
+            resp3: false,
         }
     }
 
+    // Set the ACL username for authentication (used together with password).
     fun username(self, v: String) -> ConnectOptions {
         return ConnectOptions {
             host: self.host,
@@ -59,9 +64,11 @@ impl ConnectOptions {
             db: self.db,
             client_name: self.client_name,
             read_timeout_ms: self.read_timeout_ms,
+            resp3: self.resp3,
         }
     }
 
+    // Set the password; triggers AUTH (or HELLO ... AUTH in RESP3 mode).
     fun password(self, v: String) -> ConnectOptions {
         return ConnectOptions {
             host: self.host,
@@ -71,9 +78,11 @@ impl ConnectOptions {
             db: self.db,
             client_name: self.client_name,
             read_timeout_ms: self.read_timeout_ms,
+            resp3: self.resp3,
         }
     }
 
+    // Select a logical database number (SELECT) after connecting.
     fun db(self, v: Int) -> ConnectOptions {
         return ConnectOptions {
             host: self.host,
@@ -83,9 +92,11 @@ impl ConnectOptions {
             db: v,
             client_name: self.client_name,
             read_timeout_ms: self.read_timeout_ms,
+            resp3: self.resp3,
         }
     }
 
+    // Set a connection name (CLIENT SETNAME) for observability.
     fun client_name(self, v: String) -> ConnectOptions {
         return ConnectOptions {
             host: self.host,
@@ -95,9 +106,11 @@ impl ConnectOptions {
             db: self.db,
             client_name: v,
             read_timeout_ms: self.read_timeout_ms,
+            resp3: self.resp3,
         }
     }
 
+    // Set a per-read timeout in milliseconds (0 = block indefinitely).
     fun read_timeout_ms(self, v: Int) -> ConnectOptions {
         return ConnectOptions {
             host: self.host,
@@ -107,12 +120,28 @@ impl ConnectOptions {
             db: self.db,
             client_name: self.client_name,
             read_timeout_ms: v,
+            resp3: self.resp3,
+        }
+    }
+
+    // Negotiate RESP3 (HELLO 3) on connect. Requires Redis 6+.
+    fun resp3(self, v: Bool) -> ConnectOptions {
+        return ConnectOptions {
+            host: self.host,
+            port: self.port,
+            username: self.username,
+            password: self.password,
+            db: self.db,
+            client_name: self.client_name,
+            read_timeout_ms: self.read_timeout_ms,
+            resp3: v,
         }
     }
 }
 
-// Connect with options, running the AUTH / SELECT / CLIENT SETNAME handshake
-// as configured (skipped when the corresponding field is unset).
+// Connect with options. In RESP3 mode (opts.resp3), authentication and the
+// connection name are folded into a single HELLO 3 command; otherwise the
+// classic AUTH / CLIENT SETNAME commands are used. SELECT runs afterwards.
 fun connect_opts(opts: ConnectOptions) -> Result<Client, Error> {
     let addr = opts.host.concat(":").concat("${opts.port}")
     let stream = tcp_connect(addr)?
@@ -120,18 +149,38 @@ fun connect_opts(opts: ConnectOptions) -> Result<Client, Error> {
     if opts.read_timeout_ms > 0 {
         client.stream.set_read_timeout_ms(opts.read_timeout_ms)
     }
-    if opts.password.len() > 0 {
-        if opts.username.len() > 0 {
-            let _auth = client.command(["AUTH", opts.username, opts.password])?
-        } else {
-            let _auth = client.command(["AUTH", opts.password])?
+    if opts.resp3 {
+        // HELLO 3 [AUTH user pass] [SETNAME name] — upgrades to RESP3 and
+        // authenticates in one round trip. Errors if the server is < 6.
+        let args = ["HELLO", "3"]
+        if opts.password.len() > 0 {
+            args.push("AUTH")
+            if opts.username.len() > 0 {
+                args.push(opts.username)
+            } else {
+                args.push("default")
+            }
+            args.push(opts.password)
+        }
+        if opts.client_name.len() > 0 {
+            args.push("SETNAME")
+            args.push(opts.client_name)
+        }
+        let _hello = client.command(args)?
+    } else {
+        if opts.password.len() > 0 {
+            if opts.username.len() > 0 {
+                let _auth = client.command(["AUTH", opts.username, opts.password])?
+            } else {
+                let _auth = client.command(["AUTH", opts.password])?
+            }
+        }
+        if opts.client_name.len() > 0 {
+            let _name = client.command(["CLIENT", "SETNAME", opts.client_name])?
         }
     }
     if opts.db != 0 {
         let _sel = client.command(["SELECT", "${opts.db}"])?
-    }
-    if opts.client_name.len() > 0 {
-        let _name = client.command(["CLIENT", "SETNAME", opts.client_name])?
     }
     return Ok(client)
 }
@@ -187,24 +236,36 @@ impl Client {
         return Err(error("unreachable"))
     }
 
+    // Close the underlying socket. The Client must not be used afterwards.
     fun close(self) {
         self.stream.close()
     }
 
+    // Upgrade this connection to RESP3 (HELLO 3) and return the server's
+    // handshake map. Use this when the connection was opened with `connect`.
+    // Requires Redis 6+.
+    fun hello3(self) -> Result<Value, Error> {
+        return self.command(["HELLO", "3"])
+    }
+
     // --- Typed helpers (common commands) ---
+    // PING the server; returns "PONG" on success.
     fun ping(self) -> Result<String, Error> {
         return _expect_string(self.command(["PING"])?)
     }
 
+    // ECHO a message back from the server.
     fun echo(self, msg: String) -> Result<String, Error> {
         return _expect_string(self.command(["ECHO", msg])?)
     }
 
+    // SET key to a string value (no expiry).
     fun set(self, key: String, val: String) -> Result<Bool, Error> {
         self.command(["SET", key, val])?
         return Ok(true)
     }
 
+    // GET a key's value; None if the key does not exist.
     fun get(self, key: String) -> Result<Option<String>, Error> {
         let v = self.command(["GET", key])?
         return match v {
@@ -214,6 +275,7 @@ impl Client {
         }
     }
 
+    // DEL one or more keys; returns the number removed.
     fun del(self, keys: List<String>) -> Result<Int, Error> {
         let args = ["DEL"]
         for k in keys {
@@ -222,6 +284,7 @@ impl Client {
         return _expect_int(self.command(args)?)
     }
 
+    // EXISTS — count how many of the given keys exist.
     fun exists(self, keys: List<String>) -> Result<Int, Error> {
         let args = ["EXISTS"]
         for k in keys {
@@ -230,19 +293,23 @@ impl Client {
         return _expect_int(self.command(args)?)
     }
 
+    // INCR — increment a key by one; returns the new value.
     fun incr(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["INCR", key])?)
     }
 
+    // DECR — decrement a key by one; returns the new value.
     fun decr(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["DECR", key])?)
     }
 
+    // EXPIRE — set a key's time-to-live in seconds. True if the timeout was set.
     fun expire(self, key: String, seconds: Int) -> Result<Bool, Error> {
         let n = _expect_int(self.command(["EXPIRE", key, "${seconds}"])?)?
         return Ok(n == 1)
     }
 
+    // TTL — remaining time-to-live in seconds (-1 no expiry, -2 missing key).
     fun ttl(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["TTL", key])?)
     }
