@@ -2,7 +2,22 @@
 
 A Redis client for the [Raven](https://martian56.github.io/raven/) programming language.
 
-> Current release: **v0.2.0**. Pre-1.0, so the API may still evolve between minor versions.
+> Current release: **v0.3.0**. Pre-1.0, so the API may still evolve between minor versions.
+
+## Installation
+
+Add the dependency to your `rv.toml`:
+
+```toml
+[dependencies]
+"github.com/nazarli-shabnam/raven-redis" = "0.3.0"
+```
+
+or from the command line:
+
+```
+rvpm add github.com/nazarli-shabnam/raven-redis@v0.3.0
+```
 
 ## Quick start
 
@@ -49,6 +64,27 @@ let opts = ConnectOptions.new("127.0.0.1", 6379)
 let client = connect_opts(opts)?
 ```
 
+## RESP3
+
+RESP3 (Redis 6+) is the newer protocol with richer, self-describing reply
+types (maps, sets, doubles, booleans, …). It's **opt-in**: a connection speaks
+RESP2 unless you upgrade it. Either set the option at connect time —
+
+```raven
+let opts = ConnectOptions.new("127.0.0.1", 6379).resp3(true)
+let client = connect_opts(opts)?   // sends HELLO 3 (folds in AUTH / SETNAME)
+```
+
+— or upgrade an existing plain connection:
+
+```raven
+let info = client.hello3()?        // returns the server's handshake Map
+```
+
+Once in RESP3 mode the server uses the extra reply types: e.g. `HGETALL`
+returns a `Map`, `SMEMBERS` a `Set`, doubles arrive as `Double`. Requires
+Redis 6+ (`hello3` / `resp3` error on older servers).
+
 ## Pipelining
 
 Send several commands in one round trip and get one reply per command:
@@ -74,16 +110,26 @@ rather than aborting), so one failing command never desyncs the rest.
 import "github.com/nazarli-shabnam/raven-redis/resp" { Value }
 
 enum Value {
-    Simple(String),       // +OK
-    Error(String),        // -ERR ...  (top-level errors surface as Err instead)
-    Int(Int),             // :123
-    Bulk(String),         // $... bulk string (binary-safe)
-    Null,                 // $-1 / *-1
-    Array(List<Value>),   // *...
+    // RESP2
+    Simple(String),            // +OK
+    Error(String),             // -ERR ...  (top-level errors surface as Err instead)
+    Int(Int),                  // :123
+    Bulk(String),              // $... bulk string (binary-safe)
+    Null,                      // $-1 / *-1  (or _ in RESP3)
+    Array(List<Value>),        // *...
+    // RESP3
+    Bool(Bool),                // #t / #f
+    Double(Float),             // ,3.14
+    BigNumber(String),         // (1234...   (kept as text)
+    Verbatim(String, String),  // =...  -> (format, text)
+    Map(List<Value>),          // %...  -> flat key,value,key,value,...
+    Set(List<Value>),          // ~...
+    Push(List<Value>),         // >...  (out-of-band / pub-sub)
 }
 ```
 
-Accessor helpers: `as_string()`, `as_int()`, `as_array()`, `is_null()`.
+Accessor helpers: `as_string()` (Simple/Bulk/Verbatim), `as_int()`, `as_bool()`,
+`as_double()`, `as_array()` (Array/Set/Push), `as_map()`, `is_null()`.
 
 ## Typed helpers
 
@@ -113,11 +159,14 @@ while done == false {
 }
 ```
 
-## Limitations (v1)
+## Limitations
 
-- **RESP2 only.** RESP3 is **not implemented yet** (planned for a future release).
 - **No TLS.** Raven's `std/net` has no TLS support, so connections are plaintext only.
 - **Single connection, no pooling.** Raven v2 has no concurrency.
+- **No pub/sub API yet.** RESP3 `Push` frames are parsed, but there's no
+  subscription loop helper.
+- **RESP3 attributes** (`|`) are parsed and skipped, not surfaced.
+- **inf / -inf / nan doubles** are not supported (rare in practice).
 
 ## Testing
 

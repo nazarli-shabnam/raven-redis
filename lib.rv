@@ -5,7 +5,7 @@
 // Power users running arbitrary commands also import `Value` from the
 // `resp` submodule to destructure replies.
 //
-// RESP2 only. RESP3 is intentionally NOT implemented yet (future release).
+// Speaks RESP2 by default; RESP3 is opt-in via ConnectOptions.resp3 / hello3.
 // No TLS (std/net has none). Single connection, no pooling.
 
 import std/net { connect as tcp_connect, TcpStream }
@@ -236,6 +236,7 @@ impl Client {
         return Err(error("unreachable"))
     }
 
+    // Close the underlying socket. The Client must not be used afterwards.
     fun close(self) {
         self.stream.close()
     }
@@ -248,19 +249,23 @@ impl Client {
     }
 
     // --- Typed helpers (common commands) ---
+    // PING the server; returns "PONG" on success.
     fun ping(self) -> Result<String, Error> {
         return _expect_string(self.command(["PING"])?)
     }
 
+    // ECHO a message back from the server.
     fun echo(self, msg: String) -> Result<String, Error> {
         return _expect_string(self.command(["ECHO", msg])?)
     }
 
+    // SET key to a string value (no expiry).
     fun set(self, key: String, val: String) -> Result<Bool, Error> {
         self.command(["SET", key, val])?
         return Ok(true)
     }
 
+    // GET a key's value; None if the key does not exist.
     fun get(self, key: String) -> Result<Option<String>, Error> {
         let v = self.command(["GET", key])?
         return match v {
@@ -270,6 +275,7 @@ impl Client {
         }
     }
 
+    // DEL one or more keys; returns the number removed.
     fun del(self, keys: List<String>) -> Result<Int, Error> {
         let args = ["DEL"]
         for k in keys {
@@ -278,6 +284,7 @@ impl Client {
         return _expect_int(self.command(args)?)
     }
 
+    // EXISTS — count how many of the given keys exist.
     fun exists(self, keys: List<String>) -> Result<Int, Error> {
         let args = ["EXISTS"]
         for k in keys {
@@ -286,19 +293,23 @@ impl Client {
         return _expect_int(self.command(args)?)
     }
 
+    // INCR — increment a key by one; returns the new value.
     fun incr(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["INCR", key])?)
     }
 
+    // DECR — decrement a key by one; returns the new value.
     fun decr(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["DECR", key])?)
     }
 
+    // EXPIRE — set a key's time-to-live in seconds. True if the timeout was set.
     fun expire(self, key: String, seconds: Int) -> Result<Bool, Error> {
         let n = _expect_int(self.command(["EXPIRE", key, "${seconds}"])?)?
         return Ok(n == 1)
     }
 
+    // TTL — remaining time-to-live in seconds (-1 no expiry, -2 missing key).
     fun ttl(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["TTL", key])?)
     }
