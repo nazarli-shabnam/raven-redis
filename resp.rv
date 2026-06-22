@@ -1,19 +1,29 @@
-// resp.rv — the RESP2 wire protocol: reply model, encoder, and a pure,
+// resp.rv — the RESP wire protocol: reply model, encoder, and a pure,
 // non-blocking parser. Nothing here touches a socket, so it is fully
 // unit-testable against in-memory byte strings.
 //
-// RESP3 is intentionally NOT implemented yet (planned for a later release).
+// Supports both RESP2 and RESP3. RESP3 only adds new first-byte cases, so the
+// same parser decodes either; a connection upgrades to RESP3 by sending
+// `HELLO 3` (see ConnectOptions.resp3 in lib.rv).
 
 import std/string
 
-// A decoded Redis reply (RESP2).
+// A decoded Redis reply. The first six variants are RESP2; the rest are the
+// extra self-describing types introduced by RESP3.
 enum Value {
     Simple(String), // +OK\r\n
-    Error(String), // -ERR ...\r\n  (the client maps top-level errors to Err)
+    Error(String), // -ERR ...\r\n / !<n>\r\n...  (top-level errors become Err)
     Int(Int), // :123\r\n
     Bulk(String), // $<n>\r\n<bytes>\r\n  (binary-safe)
-    Null, // $-1\r\n or *-1\r\n
+    Null, // $-1 / *-1 (RESP2) or _\r\n (RESP3)
     Array(List<Value>), // *<n>\r\n<elements...>
+    Bool(Bool), // #t\r\n / #f\r\n
+    Double(Float), // ,3.14\r\n
+    BigNumber(String), // (1234...\r\n  (kept as text; may exceed Int)
+    Verbatim(String, String), // =<n>\r\n<fmt>:<text>  -> (fmt, text)
+    Map(List<Value>), // %<n>  -> 2n elements, alternating key,value
+    Set(List<Value>), // ~<n>\r\n<elements...>
+    Push(List<Value>), // ><n>\r\n<elements...>  (out-of-band / pub-sub)
 }
 
 // Result of attempting to parse one frame starting at a byte offset.
@@ -26,11 +36,12 @@ enum _ParseResult {
 // --- Reply accessors (ergonomic extraction) ---
 
 impl Value {
-    // The text of a simple or bulk string, if this is one.
+    // The text of a simple, bulk, or verbatim string, if this is one.
     fun as_string(self) -> Option<String> {
         return match self {
             Simple(s) -> Some(s),
             Bulk(s) -> Some(s),
+            Verbatim(_f, t) -> Some(t),
             _ -> None,
         }
     }
@@ -43,14 +54,41 @@ impl Value {
         }
     }
 
-    // The elements, if this is an array reply.
-    fun as_array(self) -> Option<List<Value>> {
+    // The boolean payload, if this is a RESP3 Bool reply.
+    fun as_bool(self) -> Option<Bool> {
         return match self {
-            Array(xs) -> Some(xs),
+            Bool(b) -> Some(b),
             _ -> None,
         }
     }
 
+    // The floating-point payload, if this is a RESP3 Double reply.
+    fun as_double(self) -> Option<Float> {
+        return match self {
+            Double(d) -> Some(d),
+            _ -> None,
+        }
+    }
+
+    // The elements, if this is an array, set, or push reply.
+    fun as_array(self) -> Option<List<Value>> {
+        return match self {
+            Array(xs) -> Some(xs),
+            Set(xs) -> Some(xs),
+            Push(xs) -> Some(xs),
+            _ -> None,
+        }
+    }
+
+    // The flat key,value,... list, if this is a RESP3 Map reply.
+    fun as_map(self) -> Option<List<Value>> {
+        return match self {
+            Map(xs) -> Some(xs),
+            _ -> None,
+        }
+    }
+
+    // True if this reply is the null value (RESP2 or RESP3).
     fun is_null(self) -> Bool {
         return match self {
             Null -> true,
@@ -64,6 +102,8 @@ impl Value {
 // Encode a command as a RESP array of bulk strings:
 //   *<argc>\r\n  then for each arg  $<len>\r\n<arg>\r\n
 // Lengths are byte counts, so arbitrary binary arguments are preserved.
+// Commands are always sent in RESP2 form regardless of the negotiated reply
+// protocol (this is how the Redis wire protocol works).
 fun _encode(args: List<String>) -> String {
     let argc = args.len()
     let out = "*".concat("${argc}").concat("\r\n")
@@ -93,6 +133,7 @@ fun _find_crlf(buf: String, pos: Int) -> Int {
 
 // Parse exactly one RESP value beginning at byte offset `pos` in `buf`.
 // Pure and non-blocking: returns Incomplete when more bytes are required.
+// Handles both RESP2 and RESP3 reply types.
 fun _parse_at(buf: String, pos: Int) -> _ParseResult {
     if pos >= buf.len() {
         return _ParseResult.Incomplete
@@ -134,6 +175,79 @@ fun _parse_at(buf: String, pos: Int) -> _ParseResult {
             None -> _ParseResult.Invalid("invalid array length: ".concat(line)),
         }
     }
+
+    // --- RESP3 ---
+    // '_' null
+    if prefix == 95 {
+        return _ParseResult.Complete(Value.Null, after)
+    }
+    // '#' boolean  ("t" / "f")
+    if prefix == 35 {
+        if line.len() == 1 {
+            let b = line.byte_at(0)
+            if b == 116 {
+                return _ParseResult.Complete(Value.Bool(true), after)
+            }
+            if b == 102 {
+                return _ParseResult.Complete(Value.Bool(false), after)
+            }
+        }
+        return _ParseResult.Invalid("invalid boolean: ".concat(line))
+    }
+    // ',' double
+    if prefix == 44 {
+        return match line.parse_float() {
+            Some(d) -> _ParseResult.Complete(Value.Double(d), after),
+            None -> _ParseResult.Invalid("invalid double: ".concat(line)),
+        }
+    }
+    // '(' big number
+    if prefix == 40 {
+        return _ParseResult.Complete(Value.BigNumber(line), after)
+    }
+    // '!' blob error (length-framed like a bulk string)
+    if prefix == 33 {
+        return match line.parse_int() {
+            Some(blen) -> _parse_blob_error(buf, after, blen),
+            None -> _ParseResult.Invalid("invalid blob error length: ".concat(line)),
+        }
+    }
+    // '=' verbatim string (length-framed; body is "fmt:text")
+    if prefix == 61 {
+        return match line.parse_int() {
+            Some(vlen) -> _parse_verbatim(buf, after, vlen),
+            None -> _ParseResult.Invalid("invalid verbatim length: ".concat(line)),
+        }
+    }
+    // '%' map (count pairs => 2*count elements)
+    if prefix == 37 {
+        return match line.parse_int() {
+            Some(count) -> _rewrap_seq(buf, after, count, 0, count + count),
+            None -> _ParseResult.Invalid("invalid map length: ".concat(line)),
+        }
+    }
+    // '~' set
+    if prefix == 126 {
+        return match line.parse_int() {
+            Some(count) -> _rewrap_seq(buf, after, count, 1, count),
+            None -> _ParseResult.Invalid("invalid set length: ".concat(line)),
+        }
+    }
+    // '>' push
+    if prefix == 62 {
+        return match line.parse_int() {
+            Some(count) -> _rewrap_seq(buf, after, count, 2, count),
+            None -> _ParseResult.Invalid("invalid push length: ".concat(line)),
+        }
+    }
+    // '|' attribute: metadata map preceding the real value; consume and skip it.
+    if prefix == 124 {
+        return match line.parse_int() {
+            Some(count) -> _parse_attribute(buf, after, count),
+            None -> _ParseResult.Invalid("invalid attribute length: ".concat(line)),
+        }
+    }
+
     return _ParseResult.Invalid("unknown reply type")
 }
 
@@ -148,6 +262,35 @@ fun _parse_bulk(buf: String, start: Int, blen: Int) -> _ParseResult {
     }
     let data = buf.substring(start, end)
     return _ParseResult.Complete(Value.Bulk(data), end + 2)
+}
+
+// Blob error body: like a bulk string, but the bytes are an error message.
+fun _parse_blob_error(buf: String, start: Int, blen: Int) -> _ParseResult {
+    if blen < 0 {
+        return _ParseResult.Invalid("negative blob error length")
+    }
+    let end = start + blen
+    if buf.len() < end + 2 {
+        return _ParseResult.Incomplete
+    }
+    let data = buf.substring(start, end)
+    return _ParseResult.Complete(Value.Error(data), end + 2)
+}
+
+// Verbatim body: like a bulk string; the first 3 bytes are a format tag, then
+// a ':' separator, then the text. e.g. "txt:Some string".
+fun _parse_verbatim(buf: String, start: Int, vlen: Int) -> _ParseResult {
+    if vlen < 0 {
+        return _ParseResult.Invalid("negative verbatim length")
+    }
+    let end = start + vlen
+    if buf.len() < end + 2 {
+        return _ParseResult.Incomplete
+    }
+    let body = buf.substring(start, end)
+    let fmt = body.substring(0, 3)
+    let text = body.substring(4, body.len())
+    return _ParseResult.Complete(Value.Verbatim(fmt, text), end + 2)
 }
 
 // Array body: `count` elements parsed in sequence, starting at `start`.
@@ -174,4 +317,57 @@ fun _parse_array(buf: String, start: Int, count: Int) -> _ParseResult {
         i = i + 1
     }
     return _ParseResult.Complete(Value.Array(items), cur)
+}
+
+// Collect `elems` elements (reusing _parse_array) and rewrap the resulting list
+// as a Map (kind 0), Set (kind 1), or Push (kind 2).
+fun _rewrap_seq(buf: String, start: Int, count: Int, kind: Int, elems: Int) -> _ParseResult {
+    if count < 0 {
+        return _ParseResult.Invalid("negative aggregate length")
+    }
+    match _parse_array(buf, start, elems) {
+        Complete(arr, np) -> {
+            match arr {
+                Array(xs) -> {
+                    if kind == 0 {
+                        return _ParseResult.Complete(Value.Map(xs), np)
+                    }
+                    if kind == 1 {
+                        return _ParseResult.Complete(Value.Set(xs), np)
+                    }
+                    return _ParseResult.Complete(Value.Push(xs), np)
+                },
+                _ -> {
+                    return _ParseResult.Invalid("aggregate: internal error")
+                },
+            }
+        },
+        Incomplete -> {
+            return _ParseResult.Incomplete
+        },
+        Invalid(m) -> {
+            return _ParseResult.Invalid(m)
+        },
+    }
+    return _ParseResult.Invalid("aggregate: unreachable")
+}
+
+// Attribute: consume `count` key/value pairs (2*count elements), then parse and
+// return the actual value that follows. Attributes are skipped in this version.
+fun _parse_attribute(buf: String, start: Int, count: Int) -> _ParseResult {
+    if count < 0 {
+        return _ParseResult.Invalid("negative attribute length")
+    }
+    match _parse_array(buf, start, count + count) {
+        Complete(_attr, np) -> {
+            return _parse_at(buf, np)
+        },
+        Incomplete -> {
+            return _ParseResult.Incomplete
+        },
+        Invalid(m) -> {
+            return _ParseResult.Invalid(m)
+        },
+    }
+    return _ParseResult.Invalid("attribute: unreachable")
 }
