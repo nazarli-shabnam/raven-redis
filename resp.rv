@@ -1,0 +1,173 @@
+// resp.rv — the RESP2 wire protocol: reply model, encoder, and a pure,
+// non-blocking parser. Nothing here touches a socket, so it is fully
+// unit-testable against in-memory byte strings.
+//
+// RESP3 is intentionally NOT implemented yet (planned for a later release).
+
+import std/string
+
+// A decoded Redis reply (RESP2).
+enum Value {
+    Simple(String),       // +OK\r\n
+    Error(String),        // -ERR ...\r\n  (the client maps top-level errors to Err)
+    Int(Int),             // :123\r\n
+    Bulk(String),         // $<n>\r\n<bytes>\r\n  (binary-safe)
+    Null,                 // $-1\r\n or *-1\r\n
+    Array(List<Value>),   // *<n>\r\n<elements...>
+}
+
+// Result of attempting to parse one frame starting at a byte offset.
+enum ParseResult {
+    Complete(Value, Int),   // a full value, plus the offset just past it
+    Incomplete,             // need more bytes before a full frame is available
+    Invalid(String),        // the bytes are not valid RESP
+}
+
+// --- Reply accessors (ergonomic extraction) ---
+
+impl Value {
+    // The text of a simple or bulk string, if this is one.
+    fun as_string(self) -> Option<String> {
+        return match self {
+            Simple(s) -> Some(s),
+            Bulk(s) -> Some(s),
+            _ -> None,
+        }
+    }
+
+    // The integer payload, if this is an Int reply.
+    fun as_int(self) -> Option<Int> {
+        return match self {
+            Int(n) -> Some(n),
+            _ -> None,
+        }
+    }
+
+    // The elements, if this is an array reply.
+    fun as_array(self) -> Option<List<Value>> {
+        return match self {
+            Array(xs) -> Some(xs),
+            _ -> None,
+        }
+    }
+
+    fun is_null(self) -> Bool {
+        return match self {
+            Null -> true,
+            _ -> false,
+        }
+    }
+}
+
+// --- Encoder ---
+
+// Encode a command as a RESP array of bulk strings:
+//   *<argc>\r\n  then for each arg  $<len>\r\n<arg>\r\n
+// Lengths are byte counts, so arbitrary binary arguments are preserved.
+fun _encode(args: List<String>) -> String {
+    let argc = args.len()
+    let out = "*".concat("${argc}").concat("\r\n")
+    for a in args {
+        let n = a.len()
+        out = out.concat("$").concat("${n}").concat("\r\n").concat(a).concat("\r\n")
+    }
+    return out
+}
+
+// --- Parser ---
+
+// Index of the '\r' of the next CRLF at or after `pos`, or -1 if none yet.
+fun _find_crlf(buf: String, pos: Int) -> Int {
+    let i = pos
+    let n = buf.len()
+    while i + 1 < n {
+        if buf.byte_at(i) == 13 {
+            if buf.byte_at(i + 1) == 10 {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Parse exactly one RESP value beginning at byte offset `pos` in `buf`.
+// Pure and non-blocking: returns Incomplete when more bytes are required.
+fun _parse_at(buf: String, pos: Int) -> ParseResult {
+    if pos >= buf.len() {
+        return ParseResult.Incomplete
+    }
+    let prefix = buf.byte_at(pos)
+    let crlf = _find_crlf(buf, pos)
+    if crlf < 0 {
+        return ParseResult.Incomplete
+    }
+    let line = buf.substring(pos + 1, crlf)
+    let after = crlf + 2
+
+    // '+' simple string
+    if prefix == 43 {
+        return ParseResult.Complete(Value.Simple(line), after)
+    }
+    // '-' error
+    if prefix == 45 {
+        return ParseResult.Complete(Value.Error(line), after)
+    }
+    // ':' integer
+    if prefix == 58 {
+        return match line.parse_int() {
+            Some(n) -> ParseResult.Complete(Value.Int(n), after),
+            None -> ParseResult.Invalid("invalid integer: ".concat(line)),
+        }
+    }
+    // '$' bulk string
+    if prefix == 36 {
+        return match line.parse_int() {
+            Some(blen) -> _parse_bulk(buf, after, blen),
+            None -> ParseResult.Invalid("invalid bulk length: ".concat(line)),
+        }
+    }
+    // '*' array
+    if prefix == 42 {
+        return match line.parse_int() {
+            Some(count) -> _parse_array(buf, after, count),
+            None -> ParseResult.Invalid("invalid array length: ".concat(line)),
+        }
+    }
+    return ParseResult.Invalid("unknown reply type")
+}
+
+// Bulk body: `blen` bytes followed by CRLF, starting at `start`.
+fun _parse_bulk(buf: String, start: Int, blen: Int) -> ParseResult {
+    if blen < 0 {
+        return ParseResult.Complete(Value.Null, start)
+    }
+    let end = start + blen
+    if buf.len() < end + 2 {
+        return ParseResult.Incomplete
+    }
+    let data = buf.substring(start, end)
+    return ParseResult.Complete(Value.Bulk(data), end + 2)
+}
+
+// Array body: `count` elements parsed in sequence, starting at `start`.
+fun _parse_array(buf: String, start: Int, count: Int) -> ParseResult {
+    if count < 0 {
+        return ParseResult.Complete(Value.Null, start)
+    }
+    let items: List<Value> = []
+    let cur = start
+    let i = 0
+    while i < count {
+        match _parse_at(buf, cur) {
+            Complete(v, np) -> {
+                items.push(v)
+                cur = np
+            }
+            Incomplete -> { return ParseResult.Incomplete }
+            Invalid(m) -> { return ParseResult.Invalid(m) }
+        }
+        i = i + 1
+    }
+    return ParseResult.Complete(Value.Array(items), cur)
+}
