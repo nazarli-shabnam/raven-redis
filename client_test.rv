@@ -28,7 +28,19 @@ fun _run(addr: String) -> Result<Bool, Error> {
     let c = connect(addr)?
 
     // Start clean (targeted, never FLUSHDB).
-    c.del(["rrtest:k", "rrtest:bin", "rrtest:n", "rrtest:str", "rrtest:a"])?
+    c.del(
+        [
+            "rrtest:k",
+            "rrtest:bin",
+            "rrtest:n",
+            "rrtest:str",
+            "rrtest:a",
+            "rrtest:m1",
+            "rrtest:m2",
+            "rrtest:nx",
+            "rrtest:cnt",
+        ],
+    )?
 
     // PING
     assert_eq_str(c.ping()?, "PONG")
@@ -74,8 +86,57 @@ fun _run(addr: String) -> Result<Bool, Error> {
     let replies = c.pipeline([["SET", "rrtest:a", "1"], ["INCR", "rrtest:a"], ["GET", "rrtest:a"]])?
     assert_eq_int(replies.len(), 3)
 
+    // --- v0.2.0 helpers ---
+    // MSET / MGET (missing key -> None)
+    c.mset([["rrtest:m1", "x"], ["rrtest:m2", "y"]])?
+    let vals = c.mget(["rrtest:m1", "rrtest:m2", "rrtest:missing"])?
+    assert_eq_int(vals.len(), 3)
+    let somes = 0
+    let nones = 0
+    for o in vals {
+        match o {
+            Some(_s) -> {
+                somes = somes + 1
+            },
+            None -> {
+                nones = nones + 1
+            },
+        }
+    }
+    assert_eq_int(somes, 2)
+    assert_eq_int(nones, 1)
+
+    // SET NX: first stores, second is rejected.
+    assert(c.set_nx("rrtest:nx", "1")?)
+    if c.set_nx("rrtest:nx", "2")? {
+        assert_msg(false, "set_nx should fail on an existing key")
+    }
+
+    // INCRBY
+    c.set("rrtest:cnt", "10")?
+    assert_eq_int(c.incr_by("rrtest:cnt", 5)?, 15)
+
+    // TYPE
+    assert_eq_str(c.type_of("rrtest:m1")?, "string")
+
+    // KEYS / SCAN see our prefixed keys.
+    let found = c.keys("rrtest:*")?
+    assert(found.len() >= 1)
+    let sr = c.scan(0, "rrtest:*", 100)?
+    assert(sr.cursor >= 0)
+
     // Final cleanup.
-    c.del(["rrtest:bin", "rrtest:str", "rrtest:a"])?
+    c.del(
+        [
+            "rrtest:bin",
+            "rrtest:str",
+            "rrtest:a",
+            "rrtest:m1",
+            "rrtest:m2",
+            "rrtest:nx",
+            "rrtest:cnt",
+        ],
+    )?
     c.close()
     return Ok(true)
 }
