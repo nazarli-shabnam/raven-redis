@@ -1,0 +1,81 @@
+// Integration tests — exercised against a live Redis at ADDR.
+//
+// They are GATED on reachability: if no server is listening, they skip
+// (so `rvpm test` stays green offline; the protocol itself is covered by the
+// network-free unit tests in resp_test.rv). Bring a server up with:
+//   docker run --rm -p 6379:6379 redis:7
+//
+// Safety: tests use the `rrtest:` key prefix and clean up only those keys.
+// They never call FLUSHDB, so pointing at a real server will not wipe data.
+
+import std/test { assert, assert_msg, assert_eq_int, assert_eq_str }
+import std/net { reachable }
+import "./lib" { connect, Client }
+
+const ADDR: String = "127.0.0.1:6379"
+
+fun test_integration_suite() {
+    if reachable(ADDR) {
+        match _run(ADDR) {
+            Ok(_) -> assert(true),
+            Err(e) -> assert_msg(false, e.message),
+        }
+    }
+}
+
+// The whole flow as one Result-returning routine so we can use `?`.
+fun _run(addr: String) -> Result<Bool, Error> {
+    let c = connect(addr)?
+
+    // Start clean (targeted, never FLUSHDB).
+    c.del(["rrtest:k", "rrtest:bin", "rrtest:n", "rrtest:str", "rrtest:a"])?
+
+    // PING
+    assert_eq_str(c.ping()?, "PONG")
+
+    // SET / GET roundtrip
+    c.set("rrtest:k", "v")?
+    match c.get("rrtest:k")? {
+        Some(s) -> assert_eq_str(s, "v"),
+        None -> assert_msg(false, "expected value for rrtest:k"),
+    }
+
+    // Missing key -> None
+    match c.get("rrtest:missing")? {
+        Some(_x) -> assert_msg(false, "expected None for missing key"),
+        None -> assert(true),
+    }
+
+    // Binary-safe value: contains CRLF and a NUL byte.
+    c.set("rrtest:bin", "a\r\n\0b")?
+    match c.get("rrtest:bin")? {
+        Some(s) -> {
+            assert_eq_int(s.len(), 5)
+            assert_eq_str(s, "a\r\n\0b")
+        },
+        None -> assert_msg(false, "expected value for rrtest:bin"),
+    }
+
+    // INCR
+    c.set("rrtest:n", "10")?
+    assert_eq_int(c.incr("rrtest:n")?, 11)
+
+    // DEL count
+    assert_eq_int(c.del(["rrtest:k", "rrtest:n"])?, 2)
+
+    // A Redis error reply surfaces as Err (WRONGTYPE).
+    c.set("rrtest:str", "x")?
+    match c.command(["LPUSH", "rrtest:str", "y"]) {
+        Ok(_v) -> assert_msg(false, "expected WRONGTYPE error"),
+        Err(_e) -> assert(true),
+    }
+
+    // Pipeline: three commands, three replies.
+    let replies = c.pipeline([["SET", "rrtest:a", "1"], ["INCR", "rrtest:a"], ["GET", "rrtest:a"]])?
+    assert_eq_int(replies.len(), 3)
+
+    // Final cleanup.
+    c.del(["rrtest:bin", "rrtest:str", "rrtest:a"])?
+    c.close()
+    return Ok(true)
+}
