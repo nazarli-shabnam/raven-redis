@@ -7,7 +7,7 @@ A Redis client for the [Raven](https://martian56.github.io/raven/) programming l
 ## Quick start
 
 ```raven
-import "github.com/martian56/raven-redis" { connect }
+import "github.com/nazarli-shabnam/raven-redis" { connect }
 
 fun main() {
     match connect("127.0.0.1:6379") {
@@ -71,7 +71,7 @@ rather than aborting), so one failing command never desyncs the rest.
 `resp` submodule:
 
 ```raven
-import "github.com/martian56/raven-redis/resp" { Value }
+import "github.com/nazarli-shabnam/raven-redis/resp" { Value }
 
 enum Value {
     Simple(String),       // +OK
