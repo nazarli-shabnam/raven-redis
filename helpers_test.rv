@@ -1,0 +1,59 @@
+// Network-free unit tests for the v0.2.0 reply-conversion helpers.
+
+import std/test { assert_msg, assert_eq_int }
+import "./resp" { Value }
+import "./lib" { _to_string_list, _to_opt_string_list, _parse_scan }
+
+fun test_to_string_list() {
+    let v = Value.Array([Value.Bulk("a"), Value.Bulk("b"), Value.Bulk("c")])
+    match _to_string_list(v) {
+        Ok(xs) -> assert_eq_int(xs.len(), 3),
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+fun test_to_opt_string_list_with_null() {
+    let v = Value.Array([Value.Bulk("a"), Value.Null, Value.Bulk("c")])
+    match _to_opt_string_list(v) {
+        Ok(xs) -> {
+            assert_eq_int(xs.len(), 3)
+            let nones = 0
+            for o in xs {
+                match o {
+                    None -> {
+                        nones = nones + 1
+                    },
+                    Some(_s) -> {},
+                }
+            }
+            assert_eq_int(nones, 1)
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+fun test_parse_scan() {
+    // Reply shape: [ "5", ["k1", "k2"] ]
+    let inner = Value.Array([Value.Bulk("k1"), Value.Bulk("k2")])
+    let v = Value.Array([Value.Bulk("5"), inner])
+    match _parse_scan(v) {
+        Ok(r) -> {
+            assert_eq_int(r.cursor, 5)
+            assert_eq_int(r.keys.len(), 2)
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+fun test_parse_scan_finished() {
+    // Cursor "0" means iteration complete, with possibly more keys.
+    let inner = Value.Array([Value.Bulk("only")])
+    let v = Value.Array([Value.Bulk("0"), inner])
+    match _parse_scan(v) {
+        Ok(r) -> {
+            assert_eq_int(r.cursor, 0)
+            assert_eq_int(r.keys.len(), 1)
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}

@@ -2,7 +2,7 @@
 
 A Redis client for the [Raven](https://martian56.github.io/raven/) programming language.
 
-> ⚠️ **Pre-release / work in progress.** API may change until `v0.1.0` is tagged.
+> Current release: **v0.2.0**. Pre-1.0, so the API may still evolve between minor versions.
 
 ## Quick start
 
@@ -85,10 +85,33 @@ enum Value {
 
 Accessor helpers: `as_string()`, `as_int()`, `as_array()`, `is_null()`.
 
-## Typed helpers (v1)
+## Typed helpers
 
-`ping`, `echo`, `set`, `get`, `del`, `exists`, `expire`, `ttl`, `incr`, `decr`.
-Everything else: use `command(args)`.
+Strings / counters: `set`, `set_ex`, `set_nx`, `get`, `mset`, `mget`,
+`incr`, `decr`, `incr_by`, `decr_by`.
+
+Keys / lifetime: `del`, `exists`, `expire`, `persist`, `ttl`, `type_of`,
+`keys`, `scan`.
+
+Connection: `ping`, `echo`, `close`.
+
+Everything else: use `command(args)`. `scan` returns a `ScanResult { cursor, keys }`
+— iterate from cursor `0` until it returns `0` again:
+
+```raven
+let cursor = 0
+let done = false
+while done == false {
+    let step = client.scan(cursor, "user:*", 100)?
+    for k in step.keys {
+        print(k)
+    }
+    cursor = step.cursor
+    if cursor == 0 {
+        done = true
+    }
+}
+```
 
 ## Limitations (v1)
 

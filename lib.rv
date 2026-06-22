@@ -246,6 +246,83 @@ impl Client {
     fun ttl(self, key: String) -> Result<Int, Error> {
         return _expect_int(self.command(["TTL", key])?)
     }
+
+    // SET with an expiry in seconds (SET key val EX seconds).
+    fun set_ex(self, key: String, val: String, seconds: Int) -> Result<Bool, Error> {
+        self.command(["SET", key, val, "EX", "${seconds}"])?
+        return Ok(true)
+    }
+
+    // SET only if the key does not exist (SET key val NX).
+    // Returns true if stored, false if the key already existed.
+    fun set_nx(self, key: String, val: String) -> Result<Bool, Error> {
+        let v = self.command(["SET", key, val, "NX"])?
+        return match v {
+            Null -> Ok(false),
+            _ -> Ok(true),
+        }
+    }
+
+    // INCRBY / DECRBY.
+    fun incr_by(self, key: String, n: Int) -> Result<Int, Error> {
+        return _expect_int(self.command(["INCRBY", key, "${n}"])?)
+    }
+
+    fun decr_by(self, key: String, n: Int) -> Result<Int, Error> {
+        return _expect_int(self.command(["DECRBY", key, "${n}"])?)
+    }
+
+    // Set many key/value pairs at once. Each inner list is [key, value].
+    fun mset(self, pairs: List<List<String>>) -> Result<Bool, Error> {
+        let args = ["MSET"]
+        for p in pairs {
+            for x in p {
+                args.push(x)
+            }
+        }
+        self.command(args)?
+        return Ok(true)
+    }
+
+    // Get many values; a missing key yields None in the corresponding slot.
+    fun mget(self, keys: List<String>) -> Result<List<Option<String>>, Error> {
+        let args = ["MGET"]
+        for k in keys {
+            args.push(k)
+        }
+        return _to_opt_string_list(self.command(args)?)
+    }
+
+    // KEYS pattern — returns matching key names. (O(N); prefer scan in prod.)
+    fun keys(self, pattern: String) -> Result<List<String>, Error> {
+        return _to_string_list(self.command(["KEYS", pattern])?)
+    }
+
+    // SCAN one step. Pass cursor 0 to start; iterate until the returned
+    // cursor is 0. An empty pattern or non-positive count omits MATCH/COUNT.
+    fun scan(self, cursor: Int, pattern: String, count: Int) -> Result<ScanResult, Error> {
+        let args = ["SCAN", "${cursor}"]
+        if pattern.len() > 0 {
+            args.push("MATCH")
+            args.push(pattern)
+        }
+        if count > 0 {
+            args.push("COUNT")
+            args.push("${count}")
+        }
+        return _parse_scan(self.command(args)?)
+    }
+
+    // TYPE key — "string", "list", "hash", ... or "none".
+    fun type_of(self, key: String) -> Result<String, Error> {
+        return _expect_string(self.command(["TYPE", key])?)
+    }
+
+    // PERSIST key — remove the TTL. True if a TTL was removed.
+    fun persist(self, key: String) -> Result<Bool, Error> {
+        let n = _expect_int(self.command(["PERSIST", key])?)?
+        return Ok(n == 1)
+    }
 }
 
 // Map a top-level reply to a Result: Redis errors become Err.
@@ -268,5 +345,95 @@ fun _expect_string(v: Value) -> Result<String, Error> {
         Simple(s) -> Ok(s),
         Bulk(s) -> Ok(s),
         _ -> Err(error("expected string reply")),
+    }
+}
+
+// One step of a SCAN: the next cursor (0 means iteration finished) and the
+// keys found in this step.
+struct ScanResult {
+    cursor: Int,
+    keys: List<String>,
+}
+
+// Convert an array reply of strings into a List<String>.
+fun _to_string_list(v: Value) -> Result<List<String>, Error> {
+    return match v {
+        Array(xs) -> {
+            let out: List<String> = []
+            for e in xs {
+                match e {
+                    Bulk(s) -> {
+                        out.push(s)
+                    },
+                    Simple(s) -> {
+                        out.push(s)
+                    },
+                    _ -> {
+                        return Err(error("expected string element"))
+                    },
+                }
+            }
+            Ok(out)
+        },
+        _ -> Err(error("expected array reply")),
+    }
+}
+
+// Convert an array reply into a List<Option<String>> (Null elements -> None).
+fun _to_opt_string_list(v: Value) -> Result<List<Option<String>>, Error> {
+    return match v {
+        Array(xs) -> {
+            let out: List<Option<String>> = []
+            for e in xs {
+                match e {
+                    Bulk(s) -> {
+                        out.push(Some(s))
+                    },
+                    Null -> {
+                        out.push(None)
+                    },
+                    _ -> {
+                        return Err(error("MGET: unexpected element"))
+                    },
+                }
+            }
+            Ok(out)
+        },
+        _ -> Err(error("expected array reply")),
+    }
+}
+
+fun _parse_int_or_err(s: String) -> Result<Int, Error> {
+    return match s.parse_int() {
+        Some(n) -> Ok(n),
+        None -> Err(error("not an integer: ".concat(s))),
+    }
+}
+
+// Parse a SCAN reply: [cursor-as-string, [keys...]].
+fun _parse_scan(v: Value) -> Result<ScanResult, Error> {
+    return match v {
+        Array(xs) -> {
+            if xs.len() != 2 {
+                return Err(error("SCAN: malformed reply"))
+            }
+            let cursor_val = Value.Null
+            let keys_val = Value.Null
+            let i = 0
+            for e in xs {
+                if i == 0 {
+                    cursor_val = e
+                }
+                if i == 1 {
+                    keys_val = e
+                }
+                i = i + 1
+            }
+            let cursor_str = _expect_string(cursor_val)?
+            let new_cursor = _parse_int_or_err(cursor_str)?
+            let keys = _to_string_list(keys_val)?
+            Ok(ScanResult { cursor: new_cursor, keys })
+        },
+        _ -> Err(error("expected array reply")),
     }
 }
