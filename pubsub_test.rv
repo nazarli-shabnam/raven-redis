@@ -1,0 +1,106 @@
+// Network-free unit tests for pub/sub frame decoding. Frames are built as
+// Value trees (Array for RESP2, Push for RESP3) and fed to _parse_pubsub.
+
+import std/test { assert, assert_msg, assert_eq_int, assert_eq_str }
+import "./resp" { Value }
+import "./lib" { _parse_pubsub, PubSubMessage, MessageKind }
+
+// RESP2 message frame: ["message", channel, payload] as an Array.
+fun test_pubsub_message_array() {
+    let f = Value.Array([Value.Bulk("message"), Value.Bulk("news"), Value.Bulk("hello")])
+    match _parse_pubsub(f) {
+        Ok(m) -> {
+            match m.kind {
+                Message -> assert(true),
+                _ -> assert_msg(false, "expected Message kind"),
+            }
+            assert_eq_str(m.channel, "news")
+            assert_eq_str(m.payload, "hello")
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+// RESP3 message frame: same content delivered as a Push.
+fun test_pubsub_message_push() {
+    let f = Value.Push([Value.Bulk("message"), Value.Bulk("ch"), Value.Bulk("yo")])
+    match _parse_pubsub(f) {
+        Ok(m) -> {
+            match m.kind {
+                Message -> assert(true),
+                _ -> assert_msg(false, "expected Message kind"),
+            }
+            assert_eq_str(m.channel, "ch")
+            assert_eq_str(m.payload, "yo")
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+// Pattern message: ["pmessage", pattern, channel, payload].
+fun test_pubsub_pmessage() {
+    let f = Value.Push(
+        [Value.Bulk("pmessage"), Value.Bulk("news.*"), Value.Bulk("news.tech"), Value.Bulk("body")],
+    )
+    match _parse_pubsub(f) {
+        Ok(m) -> {
+            match m.kind {
+                PMessage -> assert(true),
+                _ -> assert_msg(false, "expected PMessage kind"),
+            }
+            assert_eq_str(m.pattern, "news.*")
+            assert_eq_str(m.channel, "news.tech")
+            assert_eq_str(m.payload, "body")
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+// Subscribe confirmation: ["subscribe", channel, count].
+fun test_pubsub_subscribe_confirmation() {
+    let f = Value.Array([Value.Bulk("subscribe"), Value.Bulk("news"), Value.Int(1)])
+    match _parse_pubsub(f) {
+        Ok(m) -> {
+            match m.kind {
+                Subscribe -> assert(true),
+                _ -> assert_msg(false, "expected Subscribe kind"),
+            }
+            assert_eq_str(m.channel, "news")
+            assert_eq_int(m.count, 1)
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+// Unsubscribe confirmation: ["unsubscribe", channel, count].
+fun test_pubsub_unsubscribe_confirmation() {
+    let f = Value.Array([Value.Bulk("unsubscribe"), Value.Bulk("news"), Value.Int(0)])
+    match _parse_pubsub(f) {
+        Ok(m) -> {
+            match m.kind {
+                Unsubscribe -> assert(true),
+                _ -> assert_msg(false, "expected Unsubscribe kind"),
+            }
+            assert_eq_int(m.count, 0)
+        },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+// A non-array reply is not a valid pub/sub frame.
+fun test_pubsub_rejects_non_array() {
+    match _parse_pubsub(Value.Int(5)) {
+        Ok(_m) -> assert_msg(false, "expected Err for a non-array frame"),
+        Err(_e) -> assert(true),
+    }
+}
+
+// Regression: a truncated 3-element pmessage must be rejected, not silently
+// reported with an empty payload.
+fun test_pubsub_pmessage_too_short() {
+    let f = Value.Push([Value.Bulk("pmessage"), Value.Bulk("news.*"), Value.Bulk("news.tech")])
+    match _parse_pubsub(f) {
+        Ok(_m) -> assert_msg(false, "expected Err for a truncated pmessage frame"),
+        Err(_e) -> assert(true),
+    }
+}

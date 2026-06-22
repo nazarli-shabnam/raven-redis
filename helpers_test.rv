@@ -1,8 +1,8 @@
 // Network-free unit tests for the v0.2.0 reply-conversion helpers.
 
-import std/test { assert_msg, assert_eq_int }
+import std/test { assert, assert_msg, assert_eq_int, assert_eq_str }
 import "./resp" { Value }
-import "./lib" { _to_string_list, _to_opt_string_list, _parse_scan }
+import "./lib" { _to_string_list, _to_opt_string_list, _parse_scan, _value_to_result }
 
 fun test_to_string_list() {
     let v = Value.Array([Value.Bulk("a"), Value.Bulk("b"), Value.Bulk("c")])
@@ -54,6 +54,25 @@ fun test_parse_scan_finished() {
             assert_eq_int(r.cursor, 0)
             assert_eq_int(r.keys.len(), 1)
         },
+        Err(e) -> assert_msg(false, e.message),
+    }
+}
+
+// Regression: an attributed error reply must still become Err (not Ok).
+fun test_value_to_result_attributed_error() {
+    let v = Value.Attributed([Value.Bulk("k"), Value.Bulk("v")], Value.Error("boom"))
+    match _value_to_result(v) {
+        Ok(_x) -> assert_msg(false, "attributed error must surface as Err"),
+        Err(e) -> assert_eq_str(e.message, "boom"),
+    }
+}
+
+// Regression: an attributed element inside an array must be read transparently.
+fun test_to_string_list_attributed_element() {
+    let attributed = Value.Attributed([Value.Bulk("k"), Value.Bulk("v")], Value.Bulk("bar"))
+    let v = Value.Array([Value.Bulk("foo"), attributed])
+    match _to_string_list(v) {
+        Ok(xs) -> assert_eq_int(xs.len(), 2),
         Err(e) -> assert_msg(false, e.message),
     }
 }

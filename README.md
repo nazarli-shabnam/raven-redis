@@ -2,7 +2,7 @@
 
 A Redis client for the [Raven](https://martian56.github.io/raven/) programming language.
 
-> Current release: **v0.3.0**. Pre-1.0, so the API may still evolve between minor versions.
+> Current release: **v0.4.0**. Pre-1.0, so the API may still evolve between minor versions.
 
 ## Installation
 
@@ -10,13 +10,13 @@ Add the dependency to your `rv.toml`:
 
 ```toml
 [dependencies]
-"github.com/nazarli-shabnam/raven-redis" = "0.3.0"
+"github.com/nazarli-shabnam/raven-redis" = "0.4.0"
 ```
 
 or from the command line:
 
 ```
-rvpm add github.com/nazarli-shabnam/raven-redis@v0.3.0
+rvpm add github.com/nazarli-shabnam/raven-redis@v0.4.0
 ```
 
 ## Quick start
@@ -101,6 +101,39 @@ let replies = client.pipeline([
 Pipeline replies are returned **raw** (a Redis error appears as `Value.Error`
 rather than aborting), so one failing command never desyncs the rest.
 
+## Pub/Sub
+
+Publish from any client; subscribe on a **dedicated** client (in RESP2 a
+subscribed connection only accepts (un)subscribe/ping — RESP3 allows mixing):
+
+```raven
+import "github.com/nazarli-shabnam/raven-redis" { connect, MessageKind }
+
+let pub = connect("127.0.0.1:6379")?
+pub.publish("news", "hello")?              // -> number of receivers
+
+let sub = connect("127.0.0.1:6379")?
+sub.subscribe(["news"])?                    // also: psubscribe(["news.*"])
+let msg = sub.next_message()?               // blocks until the next frame
+match msg.kind {
+    Message  -> print("${msg.channel}: ${msg.payload}"),
+    PMessage -> print("${msg.pattern} ${msg.channel}: ${msg.payload}"),
+    _        -> print("control frame"),     // subscribe/unsubscribe confirmations
+}
+```
+
+`next_message()` returns a `PubSubMessage { kind, channel, pattern, payload, count }`.
+Set `ConnectOptions.read_timeout_ms(...)` on the subscriber if you want a missing
+message to error instead of blocking forever. Messages arrive as RESP2 arrays or
+RESP3 push frames transparently.
+
+## Attributes
+
+RESP3 servers may attach out-of-band metadata to a reply (the `|` type). Such a
+reply is wrapped as `Attributed(pairs, value)`. The accessors see through it, so
+existing code is unaffected; call `value.attributes()` to inspect the metadata or
+`value.without_attributes()` to get the bare value.
+
 ## Reply values
 
 `command()` returns a `Value`. To destructure it, import the type from the
@@ -125,11 +158,14 @@ enum Value {
     Map(List<Value>),          // %...  -> flat key,value,key,value,...
     Set(List<Value>),          // ~...
     Push(List<Value>),         // >...  (out-of-band / pub-sub)
+    Attributed(List<Value>, Value), // |... attribute metadata + the value
 }
 ```
 
 Accessor helpers: `as_string()` (Simple/Bulk/Verbatim), `as_int()`, `as_bool()`,
-`as_double()`, `as_array()` (Array/Set/Push), `as_map()`, `is_null()`.
+`as_double()`, `as_array()` (Array/Set/Push), `as_map()`, `is_null()`. These all see
+**through** an `Attributed` wrapper; use `attributes()` to read the metadata pairs and
+`without_attributes()` to strip them.
 
 ## Typed helpers
 
@@ -162,11 +198,8 @@ while done == false {
 ## Limitations
 
 - **No TLS.** Raven's `std/net` has no TLS support, so connections are plaintext only.
-- **Single connection, no pooling.** Raven v2 has no concurrency.
-- **No pub/sub API yet.** RESP3 `Push` frames are parsed, but there's no
-  subscription loop helper.
-- **RESP3 attributes** (`|`) are parsed and skipped, not surfaced.
-- **inf / -inf / nan doubles** are not supported (rare in practice).
+- **Single connection, no pooling.** Raven v2 has no concurrency, and pub/sub uses a
+  dedicated blocking connection.
 
 ## Testing
 
