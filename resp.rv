@@ -17,7 +17,7 @@ enum Value {
 }
 
 // Result of attempting to parse one frame starting at a byte offset.
-enum ParseResult {
+enum _ParseResult {
     Complete(Value, Int), // a full value, plus the offset just past it
     Incomplete, // need more bytes before a full frame is available
     Invalid(String), // the bytes are not valid RESP
@@ -93,67 +93,67 @@ fun _find_crlf(buf: String, pos: Int) -> Int {
 
 // Parse exactly one RESP value beginning at byte offset `pos` in `buf`.
 // Pure and non-blocking: returns Incomplete when more bytes are required.
-fun _parse_at(buf: String, pos: Int) -> ParseResult {
+fun _parse_at(buf: String, pos: Int) -> _ParseResult {
     if pos >= buf.len() {
-        return ParseResult.Incomplete
+        return _ParseResult.Incomplete
     }
     let prefix = buf.byte_at(pos)
     let crlf = _find_crlf(buf, pos)
     if crlf < 0 {
-        return ParseResult.Incomplete
+        return _ParseResult.Incomplete
     }
     let line = buf.substring(pos + 1, crlf)
     let after = crlf + 2
 
     // '+' simple string
     if prefix == 43 {
-        return ParseResult.Complete(Value.Simple(line), after)
+        return _ParseResult.Complete(Value.Simple(line), after)
     }
     // '-' error
     if prefix == 45 {
-        return ParseResult.Complete(Value.Error(line), after)
+        return _ParseResult.Complete(Value.Error(line), after)
     }
     // ':' integer
     if prefix == 58 {
         return match line.parse_int() {
-            Some(n) -> ParseResult.Complete(Value.Int(n), after),
-            None -> ParseResult.Invalid("invalid integer: ".concat(line)),
+            Some(n) -> _ParseResult.Complete(Value.Int(n), after),
+            None -> _ParseResult.Invalid("invalid integer: ".concat(line)),
         }
     }
     // '$' bulk string
     if prefix == 36 {
         return match line.parse_int() {
             Some(blen) -> _parse_bulk(buf, after, blen),
-            None -> ParseResult.Invalid("invalid bulk length: ".concat(line)),
+            None -> _ParseResult.Invalid("invalid bulk length: ".concat(line)),
         }
     }
     // '*' array
     if prefix == 42 {
         return match line.parse_int() {
             Some(count) -> _parse_array(buf, after, count),
-            None -> ParseResult.Invalid("invalid array length: ".concat(line)),
+            None -> _ParseResult.Invalid("invalid array length: ".concat(line)),
         }
     }
-    return ParseResult.Invalid("unknown reply type")
+    return _ParseResult.Invalid("unknown reply type")
 }
 
 // Bulk body: `blen` bytes followed by CRLF, starting at `start`.
-fun _parse_bulk(buf: String, start: Int, blen: Int) -> ParseResult {
+fun _parse_bulk(buf: String, start: Int, blen: Int) -> _ParseResult {
     if blen < 0 {
-        return ParseResult.Complete(Value.Null, start)
+        return _ParseResult.Complete(Value.Null, start)
     }
     let end = start + blen
     if buf.len() < end + 2 {
-        return ParseResult.Incomplete
+        return _ParseResult.Incomplete
     }
     let data = buf.substring(start, end)
-    return ParseResult.Complete(Value.Bulk(data), end + 2)
+    return _ParseResult.Complete(Value.Bulk(data), end + 2)
 }
 
 // Array body: `count` elements parsed in sequence, starting at `start`.
-fun _parse_array(buf: String, start: Int, count: Int) -> ParseResult {
+fun _parse_array(buf: String, start: Int, count: Int) -> _ParseResult {
     if count < 0 {
-        return ParseResult.Complete(Value.Null, start)
+        return _ParseResult.Complete(Value.Null, start)
     }
     let items: List<Value> = []
     let cur = start
@@ -165,13 +165,13 @@ fun _parse_array(buf: String, start: Int, count: Int) -> ParseResult {
                 cur = np
             },
             Incomplete -> {
-                return ParseResult.Incomplete
+                return _ParseResult.Incomplete
             },
             Invalid(m) -> {
-                return ParseResult.Invalid(m)
+                return _ParseResult.Invalid(m)
             },
         }
         i = i + 1
     }
-    return ParseResult.Complete(Value.Array(items), cur)
+    return _ParseResult.Complete(Value.Array(items), cur)
 }

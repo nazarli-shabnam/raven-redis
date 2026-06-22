@@ -11,7 +11,7 @@
 import std/net { connect as tcp_connect, TcpStream }
 import std/string
 import std/error { error }
-import "./resp" { Value, ParseResult, _encode, _parse_at }
+import "./resp" { Value, _ParseResult, _encode, _parse_at }
 
 // A single, synchronous connection to a Redis server.
 struct Client {

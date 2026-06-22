@@ -1,6 +1,6 @@
 import std/test { assert, assert_msg, assert_eq_int, assert_eq_str }
 import std/string
-import "./resp" { _encode, _parse_at, Value, ParseResult }
+import "./resp" { _encode, _parse_at, Value, _ParseResult }
 
 // --- Encoder ---
 
